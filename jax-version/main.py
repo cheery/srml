@@ -373,6 +373,41 @@ def evaluate(args):
 parser_eval = subparsers.add_parser('eval', help='evaluate on model')
 parser_eval.set_defaults(run=evaluate)
 
+def train2(args):
+    s = setup(args)
+    t = prepare_for_train(args, s)
+    sample_batch = load_kalevala(s.cwd)
+    print(f"Training S5 HRM haiku model | d_model={s.spec.CONFIG.d_model}, d_state={s.spec.CONFIG.d_state}")
+    print("-" * 55)
+    with open(t.ckdir / "loss.txt", "w") as loss_plot:
+        for epoch in range(t.epoch, 5000):
+            total_loss = 0
+            for step in range(t.step, s.spec.N_STEPS // 10):
+                batch = sample_batch(next(s.rng), s.spec.SEQ_LEN, s.spec.BATCH)
+                base_session_loss = supervision_train(s, t, batch) * 0.7
+                base_session_loss = max(10 * s.spec.SUPERVISION, base_session_loss) # goal
+                print(f"goal session loss: ({base_session_loss / s.spec.SUPERVISION})")
+                session_loss = supervision_train(s, t, batch)
+                for i in range(10):
+                    if session_loss <= base_session_loss:
+                        break
+                    if i % 20 == 0:
+                        print(f".. showing again ({session_loss / s.spec.SUPERVISION})")
+                    session_loss = supervision_train(s, t, batch)
+                loss_plot.write(f"{step + epoch*s.spec.N_STEPS // 10} {session_loss / s.spec.SUPERVISION}\n")
+                loss_plot.flush()
+                if t.step % s.spec.STEP_REPORT_EVERY == 0:
+                    print(f"  step {step:4d} | loss {session_loss/s.spec.SUPERVISION:.4f}")
+                t.step += 1
+                total_loss += session_loss
+            print(f"epoch {epoch+1}, loss {total_loss / s.spec.N_STEPS / s.spec.SUPERVISION}")
+            t.step = 0
+            t.save(t.params, epoch+1, 0)
+    print("Done.")
+
+parser_train2 = subparsers.add_parser('train2', help='train SRLM from ../../data/kalevala.plaintext.txt with different method.')
+parser_train2.set_defaults(run=train2)
+
 def param_memory_mb(params):
     leaves = jax.tree_util.tree_leaves(params)
     total_bytes = sum(x.size * x.dtype.itemsize for x in leaves)
