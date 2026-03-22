@@ -142,4 +142,4 @@ def apply_ssm(Lambda_bar, B_bar, C_tilde, D, input_sequence):
     _, xs = associative_scan(binary_operator, elements)
     ys = jax.vmap(lambda x, u: (C_tilde @ x + D * u).real)(xs, input_sequence)
     return ys
-#apply_ssm = jax.checkpoint(apply_ssm)
+apply_ssm = jax.checkpoint(apply_ssm)

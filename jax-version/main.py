@@ -50,6 +50,20 @@ specifications = {
             SEQ_LEN=128,
             N_STEPS=500,
             SAVE_EVERY=500),
+        "1024x256": Specification(
+            CONFIG=SRLMConfig(vocab_size = TOTAL_VOCAB,
+                              d_model = 1024, d_state = 256,
+                              n_priors = 4, n_posteriors = 3),
+            SEQ_LEN=128,
+            N_STEPS=500,
+            SAVE_EVERY=500),
+        "1024x128": Specification(
+            CONFIG=SRLMConfig(vocab_size = TOTAL_VOCAB,
+                              d_model = 1024, d_state = 128,
+                              n_priors = 4, n_posteriors = 3),
+            SEQ_LEN=128,
+            N_STEPS=500,
+            SAVE_EVERY=500),
         "512x64": Specification(
             CONFIG=SRLMConfig(vocab_size = TOTAL_VOCAB,
                               d_model = 512, d_state = 64,

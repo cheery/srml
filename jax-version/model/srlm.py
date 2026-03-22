@@ -61,11 +61,18 @@ class S5Layer(hk.Module):
         self.ff = FeedForward(cfg.d_model)
 
     def __call__(self, y, t):
-        y_norm = self.norm1(y, t)
-        y = jax.vmap(self.s5d)(y_norm)
-        y_norm = self.norm2(y, t)
-        y = self.ff(y_norm)
-        return y
+        @hk.remat
+        def _fwd(y):
+            y_norm = self.norm1(y, t)
+            s = jax.vmap(self.s5d)(y_norm)
+            s_norm = self.norm2(s, t)
+            return self.ff(s_norm)
+        return _fwd(y)
+        #y_norm = self.norm1(y, t)
+        #y = jax.vmap(self.s5d)(y_norm)
+        #y_norm = self.norm2(y, t)
+        #y = self.ff(y_norm)
+        #return y
 
 class HRM(hk.Module):
     def __init__(self, cfg, name=None):
