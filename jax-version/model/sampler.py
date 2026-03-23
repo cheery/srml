@@ -35,12 +35,26 @@ class EulerPredictor:
         """
         sigma, dsigma = self.noise(t)
         key, score_key = jax.random.split(key)
-        arg, score = score_fn(params, score_key, arg, x, sigma)
-        score = jnp.exp(score)
+        arg, log_score = score_fn(params, score_key, arg, x, sigma)
+        return arg, self.predict(key, x, log_score, dsigma)
+
+    def predict(self, key, x, log_score, dsigma, step_size):
+        score = jnp.exp(log_score)
         rev_rate = step_size * dsigma[..., None, None] * self.graph.reverse_rate(x, score)
-        key, sample_key = jax.random.split(key)
-        x = self.graph.sample_rate(sample_key, x, rev_rate)
-        return arg, x
+        x = self.graph.sample_rate(key, x, rev_rate)
+        return x
+
+    def _tree_flatten(self):
+        # first group hashables, second group not hashable.
+        return (self.graph, self.noise,), ()
+
+    @classmethod
+    def _tree_unflatten(cls, aux, children):
+      return cls(*children)
+
+jax.tree_util.register_pytree_node(EulerPredictor,
+                                   EulerPredictor._tree_flatten,
+                                   EulerPredictor._tree_unflatten)
 
 class Denoiser:
     """Final denoising step at the end of sampling."""
@@ -52,23 +66,63 @@ class Denoiser:
     def update_fn(self, key, score_fn, params, arg, x, t):
         sigma = self.noise(t)[0]
         key, score_key = jax.random.split(key)
-        arg, score = score_fn(params, score_key, arg, x, sigma)
-        score = jnp.exp(score)
+        arg, log_score = score_fn(params, score_key, arg, x, sigma)
+        return arg, self.denoise(key, x, log_score, sigma)
 
+    def denoise(self, key, x, log_score, sigma):
+        score = jnp.exp(log_score)
         stag_score = self.graph.staggered_score(score, sigma)
         probs = stag_score * self.graph.transp_transition(x, sigma)
         if self.graph.absorb:
             probs = probs[..., :-1]
+        return sample_categorical(key, probs)
 
-        return arg, sample_categorical(key, probs)
+    def _tree_flatten(self):
+        # first group hashables, second group not hashable.
+        return (self.graph, self.noise,), ()
 
+    @classmethod
+    def _tree_unflatten(cls, aux, children):
+      return cls(*children)
+
+jax.tree_util.register_pytree_node(Denoiser,
+                                   Denoiser._tree_flatten,
+                                   Denoiser._tree_unflatten)
 
 class Sampler:
-    """Runs the full reverse diffusion sampling loop.
+    """Runs the full reverse diffusion sampling loop."""
+    def __init__(self, graph, noise):
+        self.graph = graph
+        self.noise = noise
+        self.predictor = EulerPredictor(graph, noise)
+        self.denoiser = Denoiser(graph, noise)
 
-    Args:
-        cfg: config dict with at least cfg['model']['length']
-    """
+    def begin(self, key, batch_size, batch_len, steps=10, eps=1e-5):
+        x = self.graph.sample_limit2(key, batch_size, batch_len)
+        timesteps = jnp.linspace(1.0, eps, steps + 1)
+        dt = (1 - eps) / steps
+        return x, timesteps, dt, steps
+
+    def sample2(self, score_fn, projector, batch_size, batch_len):
+        def _impl_(key, params, z, q, steps=10, eps=1e-5):
+            x, timesteps, dt, steps = self.begin(key, batch_size, batch_len, steps, eps)
+            for i in range(steps):
+                t = timesteps[i] * jnp.ones((x.shape[0],))
+                x = projector(x, q)
+                sigma, dsigma = self.noise(t)
+                key, score_key = jax.random.split(key)
+                z, log_score = score_fn(params, score_key, z, x, sigma)
+                key, predict_key = jax.random.split(key)
+                x = self.predictor.predict(predict_key, x, log_score, dsigma, dt)
+
+            x = projector(x, q)
+            t = timesteps[-1] * jnp.ones((x.shape[0],))
+            sigma, _ = self.noise(t)
+            key, score_key = jax.random.split(key)
+            z, log_score = score_fn(params, score_key, z, x, sigma)
+            return z, self.denoiser.denoise(key, x, log_score, sigma)
+        return _impl_
+
     def sample(
         self,
         key,
@@ -76,8 +130,6 @@ class Sampler:
         score_fn,
         params,
         arg,
-        graph,
-        noise,
         batch_size=1,
         batch_len=32,
         steps=1024,
@@ -105,14 +157,8 @@ class Sampler:
             list of decoded strings
         """
         try:
-            predictor = EulerPredictor(graph, noise)
-            denoiser = Denoiser(graph, noise)
-
-            batch_dims = (batch_size, batch_len)
-
             key, limit_key = jax.random.split(key)
-            x = graph.sample_limit(limit_key, *batch_dims)
-
+            x = graph.sample_limit2(limit_key, batch_size, bacth_len)
             timesteps = jnp.linspace(1.0, eps, steps + 1)
             dt = (1 - eps) / steps
 
@@ -122,7 +168,7 @@ class Sampler:
                 x = projector(x)
 
                 key, step_key = jax.random.split(key)
-                arg, x = predictor.update_fn(step_key, score_fn, params, arg, x, t, dt)
+                arg, x = self.predictor.update_fn(step_key, score_fn, params, arg, x, t, dt)
 
                 if show_intermediate:
                     print(f"{i} @ {timesteps[i].item():.5f}:")
@@ -131,14 +177,25 @@ class Sampler:
 
         except KeyboardInterrupt:
             pass
-        if denoise:
-            x = projector(x)
-            t = timesteps[-1] * jnp.ones((x.shape[0],))
-            key, denoise_key = jax.random.split(key)
-            arg, x = denoiser.update_fn(denoise_key, score_fn, params, arg, x, t)
+        x = projector(x)
+        t = timesteps[-1] * jnp.ones((x.shape[0],))
+        key, denoise_key = jax.random.split(key)
+        arg, x = self.denoiser.update_fn(denoise_key, score_fn, params, arg, x, t)
         if show_intermediate:
             sentences = [tokenizer(i) for i in x]
             print("Denoised:")
             print(repr(sentences))
 
         return arg, [tokenizer(i) for i in x]
+
+    def _tree_flatten(self):
+        # first group hashables, second group not hashable.
+        return (self.graph, self.noise,), ()
+
+    @classmethod
+    def _tree_unflatten(cls, aux, children):
+      return cls(*children)
+
+jax.tree_util.register_pytree_node(Sampler,
+                                   Sampler._tree_flatten,
+                                   Sampler._tree_unflatten)

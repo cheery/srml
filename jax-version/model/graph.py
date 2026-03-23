@@ -148,6 +148,11 @@ class AbsorbingGraph(Graph):
         """Fully absorbed: all tokens are the mask token."""
         return (self.dim - 1) * jnp.ones(batch_dims, dtype=jnp.int32)
 
+    #@jax.jit(static_argnames=("batch_size","batch_len"))
+    def sample_limit2(self, key, batch_size, batch_len):
+        """Fully absorbed: all tokens are the mask token."""
+        return (self.dim - 1) * jnp.ones((batch_size, batch_len), dtype=jnp.int32)
+
     def score_entropy(self, score, sigma, x, x0):
         """Score entropy loss for training.
 
@@ -174,3 +179,15 @@ class AbsorbingGraph(Graph):
 
         entropy = jnp.where(rel_ind, pos_term - neg_term + const, 0.0)
         return entropy
+
+    def _tree_flatten(self):
+        # first group hashables, second group not hashable.
+        return (self.dim-1,), ()
+
+    @classmethod
+    def _tree_unflatten(cls, aux, children):
+      return cls(*children)
+
+jax.tree_util.register_pytree_node(AbsorbingGraph,
+                                   AbsorbingGraph._tree_flatten,
+                                   AbsorbingGraph._tree_unflatten)

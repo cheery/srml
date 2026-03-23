@@ -1,4 +1,5 @@
 import abc
+import jax
 import jax.numpy as jnp
 
 class Noise(abc.ABC):
@@ -8,6 +9,7 @@ class Noise(abc.ABC):
     but as a plain method call since hk.Module uses __call__.
     """
 
+    @jax.jit
     def __call__(self, t):
         return self.total_noise(t), self.rate_noise(t)
 
@@ -44,3 +46,15 @@ class LogLinearNoise(Noise):
 
     def total_noise(self, t):
         return -jnp.log1p(-(1 - self.eps) * t)
+
+    def _tree_flatten(self):
+        # first group hashables, second group not hashable.
+        return (self.eps,), ()
+
+    @classmethod
+    def _tree_unflatten(cls, aux, children):
+      return cls(*children)
+
+jax.tree_util.register_pytree_node(LogLinearNoise,
+                                   LogLinearNoise._tree_flatten,
+                                   LogLinearNoise._tree_unflatten)

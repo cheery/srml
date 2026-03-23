@@ -103,7 +103,7 @@ def setup(args):
 
     graph = AbsorbingGraph(VOCAB_SIZE)
     noise = LogLinearNoise()
-    sampler = Sampler()
+    sampler = Sampler(graph, noise)
     rng = hk.PRNGSequence(7)
 
     def model_spec(z, x, sigma):
@@ -369,20 +369,16 @@ parser_wikidry.set_defaults(run=wikidry)
 def evaluate(args):
     s = setup(args)
     params = prepare_for_exam(args, s)
+    def projector(x, q):
+        q = q[None,:]
+        return jnp.where(q == 256, x, q)
+    fn = s.sampler.sample2(s.model.apply, projector, 1, 64)
     while True:
         query = from_text(input("> "))
-        def projector(x):
-            return x.at[:,0:min(64, len(query))].set(query[:min(64,len(query))])
-        _, x = s.sampler.sample(next(s.rng), as_text,
-                           s.model.apply,
-                           params, mk_z(1,64, s.spec.CONFIG.d_model),
-                           s.graph,
-                           s.noise,
-                           batch_size=1,
-                           batch_len=64,
-                           steps=10,
-                           projector = projector)
-        print(repr(x))
+        z = mk_z(1, 64, s.spec.CONFIG.d_model)
+        q = jnp.pad(query, (0, 64 - len(query)), "constant", constant_values=(256, 256))
+        _, x = fn(next(s.rng), params, z, q)
+        print(repr(as_text(x[0])))
 
 parser_eval = subparsers.add_parser('eval', help='evaluate on model')
 parser_eval.set_defaults(run=evaluate)
