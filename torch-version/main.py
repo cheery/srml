@@ -20,6 +20,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch._inductor.config as inductor_config
+inductor_config.reorder_for_locality = False
 
 from model import SRLM, SRLMConfig, make_z, AbsorbingGraph, LogLinearNoise, Sampler, loss_function, MemoryBank
 from wiki_data import WikiDataLoader
@@ -464,7 +466,9 @@ def cmd_train(args):
     model = SRLM(config).to(device)
     # Load existing checkpoint
     load_checkpoint(model, ckpt_path)
-    model = torch.compile(model)
+    no_compile = getattr(args, 'no_compile', False)
+    if not no_compile:
+        model = torch.compile(model, backend="aot_eager")
     print(f"Parameters:       {param_count(model):,}")
     print(f"Parameter memory: {param_memory_mb(model):.1f} MB")
 
@@ -700,7 +704,9 @@ def cmd_eval(args):
     if not load_checkpoint(model, ckpt_path):
         print(f"No checkpoint found at {ckpt_path}")
         sys.exit(1)
-    model = torch.compile(model)
+    no_compile = getattr(args, 'no_compile', False)
+    if not no_compile:
+        model = torch.compile(model, backend="aot_eager")
     model.eval()
 
     puzzles = None
@@ -834,6 +840,8 @@ def main():
                          help="Use medium config (~30M params, d_model=384)")
     p_train.add_argument("--large", action="store_true",
                          help="Use large config (~200M params, d_model=1152)")
+    p_train.add_argument("--no-compile", action="store_true", dest="no_compile",
+                         help="Disable torch.compile (workaround for Inductor bugs)")
     p_train.add_argument("--d-model", type=int, default=None, dest="d_model",
                          help="Override d_model")
     p_train.add_argument("--n-priors", type=int, default=None, dest="n_priors",
@@ -876,6 +884,8 @@ def main():
     # --- eval ---
     p_eval = sub.add_parser("eval", help="Interactive evaluation")
     p_eval.add_argument("checkpoint", help="Checkpoint directory name")
+    p_eval.add_argument("--no-compile", action="store_true", dest="no_compile",
+                         help="Disable torch.compile")
     p_eval.add_argument("--steps", type=int, default=10,
                         help="Sampling steps (default: 10)")
     p_eval.add_argument("--seq-len", type=int, default=None,
