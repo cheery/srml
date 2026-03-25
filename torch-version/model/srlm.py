@@ -196,9 +196,11 @@ class DiTBlock(nn.Module):
 
         # Modulation network to generate adaLN parameters
         self.modulation = AdaLNModulation(embedding_dim, hidden_dim)
-
+        self.num_heads = num_heads
+        self.qkv = nn.Linear(embedding_dim, 3 * hidden_dim, bias=True)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=True)
         # Attention layer
-        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        #self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
 
         # MLP layer
         mlp_hidden_dim = int(hidden_dim * mlp_ratio)
@@ -224,7 +226,16 @@ class DiTBlock(nn.Module):
         # Modulate: Scale, Shift
         x_modulated1 = x_norm1 * (1 + scale_msa) + shift_msa
         # Apply attention
-        attn_output, _ = self.attn(x_modulated1, x_modulated1, x_modulated1)
+        B,L,H = x_modulated1.shape
+        q, k, v = self.qkv(x_modulated1).chunk(3, dim=-1)
+        q = q.view(B, L, self.num_heads, H // self.num_heads).transpose(1, 2)
+        k = k.view(B, L, self.num_heads, H // self.num_heads).transpose(1, 2)
+        v = v.view(B, L, self.num_heads, H // self.num_heads).transpose(1, 2)
+
+        attn_output = F.scaled_dot_product_attention(q, k, v)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, H)
+        attn_output = self.out_proj(attn_output)
+        #attn_output, _ = self.attn(x_modulated1, x_modulated1, x_modulated1)
         # Apply gating and add residual connection
         x = x + gate_msa * attn_output
 
