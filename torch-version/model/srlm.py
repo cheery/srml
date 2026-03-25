@@ -17,6 +17,8 @@ class SRLMConfig:
     N:                     int = 2
     T:                     int = 4
     dropout:               float = 0.1
+    chunk_size:            int = 16
+    aux_routing_weight:    float = 0.01
 
 class BlockAttnRes(nn.Module):
     """Block attention residual: weighted combination over all accumulated blocks."""
@@ -34,6 +36,57 @@ class BlockAttnRes(nn.Module):
         return h
 
 
+def chunk_mean_pool(x: torch.Tensor, chunk_size: int) -> torch.Tensor:
+    """(B, L, D) -> (B, ceil(L/P), D) via mean pooling over chunks of size P."""
+    B, L, D = x.shape
+    pad_len = (-L) % chunk_size
+    if pad_len > 0:
+        x = F.pad(x, (0, 0, 0, pad_len))
+        # mask out padding so it doesn't pollute the mean
+        mask = torch.cat([
+            torch.ones(L, device=x.device),
+            torch.zeros(pad_len, device=x.device),
+        ])
+    else:
+        mask = torch.ones(L, device=x.device)
+    n_chunks = x.shape[1] // chunk_size
+    x = x.reshape(B, n_chunks, chunk_size, D)
+    w = mask.reshape(1, n_chunks, chunk_size, 1)
+    return (x * w).sum(dim=2) / w.sum(dim=2).clamp(min=1e-8)
+
+
+class RouterProjection(nn.Module):
+    """Learned router that re-weights block contributions per posterior layer.
+
+    Projects each block to a router key and the current hidden state to a
+    router query, then computes soft routing weights via cosine similarity.
+    """
+
+    def __init__(self, d_model: int, n_heads: int = 1):
+        super().__init__()
+        self.wq = nn.Linear(d_model, d_model, bias=False)
+        self.wk = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, h: torch.Tensor, blocks: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            h: current hidden state (B, L, D) — used as query
+            blocks: list of N tensors each (B, L, D) — block representations
+        Returns:
+            weighted: (B, L, D) — router-weighted combination of blocks
+            weights: (N,) — mean routing weights (for auxiliary loss)
+        """
+        V = torch.stack(blocks)        # (N, B, L, D)
+        # Pool over sequence for routing (per-block summary)
+        q = F.normalize(self.wq(h.mean(dim=1)), dim=-1)           # (B, D)
+        k = F.normalize(self.wk(V.mean(dim=2)), dim=-1)           # (N, B, D)
+        scores = torch.einsum('b d, n b d -> n b', q, k)          # (N, B)
+        weights = scores.softmax(dim=0)                            # (N, B)
+        weighted = torch.einsum('n b, n b l d -> b l d', weights, V)
+        mean_weights = weights.mean(dim=1)                         # (N,)
+        return weighted, mean_weights
+
+
 class SRLM(nn.Module):
     def __init__(self, cfg: SRLMConfig):
         super().__init__()
@@ -49,6 +102,10 @@ class SRLM(nn.Module):
             for _ in range(cfg.n_posteriors)
         ])
         self.block_res = BlockAttnRes(cfg.d_model)
+        self.routers   = nn.ModuleList([
+            RouterProjection(cfg.d_model)
+            for _ in range(cfg.n_posteriors)
+        ])
         self.norm      = AdaLN(cfg.d_model)
         self.output    = OutputLayer(cfg)
 
@@ -65,14 +122,27 @@ class SRLM(nn.Module):
         z, y = self.main(z, h, p, t)
         blocks.append(y)
 
-        for layer in self.posterior:
-            h = self.block_res(blocks)
+        aux_routing_losses = []
+        for layer, router in zip(self.posterior, self.routers):
+            h, rw = router(blocks[-1], blocks)
             y = layer(h, p, t)
             blocks.append(y)
+            aux_routing_losses.append(rw)
 
         h = self.block_res(blocks)
         y = self.norm(h, t)
-        return z, self.output(x, y, sigma)
+
+        # Compute auxiliary routing entropy loss: encourage non-uniform routing
+        aux_loss = torch.tensor(0.0, device=x.device)
+        if self.training and aux_routing_losses:
+            for rw in aux_routing_losses:
+                # Entropy of routing weights — maximize it to prevent collapse
+                entropy = -(rw * (rw + 1e-8).log()).sum()
+                max_entropy = math.log(len(rw))
+                aux_loss = aux_loss + (max_entropy - entropy)
+            aux_loss = aux_loss / len(aux_routing_losses) * self.cfg.aux_routing_weight
+
+        return z, self.output(x, y, sigma), aux_loss
 
 class HRM(nn.Module):
     def __init__(self, cfg: SRLMConfig):
@@ -98,19 +168,41 @@ class HRM(nn.Module):
 class FastLayer(nn.Module):
     def __init__(self, cfg: SRLMConfig):
         super().__init__()
+        self.chunk_size = cfg.chunk_size
         self.normH = AdaLN(cfg.d_model)
         self.normL = AdaLN(cfg.d_model)
         self.normX = AdaLN(cfg.d_model)
+        # Cross-attention: zL queries pooled zH
+        self.cross_q = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.cross_k = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.cross_v = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.cross_out = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.n_heads = cfg.n_heads
         self.inj   = nn.Linear(cfg.d_model * 3, cfg.d_model)
         self.drop  = nn.Dropout(cfg.dropout)
         self.s5d   = DiTBlock(cfg.d_model, cfg.d_model, num_heads=cfg.n_heads, mlp_ratio=4.0, dropout=cfg.dropout)
 
     def forward(self, zH: torch.Tensor, zL: torch.Tensor, x: torch.Tensor, p: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        zH = self.normH(zH, t)
-        zL = self.normL(zL, t)
-        x  = self.normX(x, t)
-        x = torch.cat([zH, zL, x], dim=-1)  # (B, L, 3*D)
-        x = self.drop(self.inj(x))           # (B, L, D)
+        zH_norm = self.normH(zH, t)
+        zL_norm = self.normL(zL, t)
+        x_norm  = self.normX(x, t)
+
+        # Chunk-mean-pool the slow state for compressed cross-attention
+        zH_pooled = chunk_mean_pool(zH_norm, self.chunk_size)  # (B, L//P, D)
+
+        # Cross-attention: zL queries into pooled zH
+        B, L, D = zL_norm.shape
+        hd = D // self.n_heads
+        q = self.cross_q(zL_norm).view(B, L, self.n_heads, hd).transpose(1, 2)
+        Lp = zH_pooled.shape[1]
+        k = self.cross_k(zH_pooled).view(B, Lp, self.n_heads, hd).transpose(1, 2)
+        v = self.cross_v(zH_pooled).view(B, Lp, self.n_heads, hd).transpose(1, 2)
+        zH_ctx = F.scaled_dot_product_attention(q, k, v)       # (B, H, L, hd)
+        zH_ctx = zH_ctx.transpose(1, 2).contiguous().view(B, L, D)
+        zH_ctx = self.cross_out(zH_ctx)
+
+        x = torch.cat([zH_ctx, zL_norm, x_norm], dim=-1)  # (B, L, 3*D)
+        x = self.drop(self.inj(x))                         # (B, L, D)
         x = self.s5d(x, p, t)
         return x
 

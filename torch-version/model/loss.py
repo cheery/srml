@@ -27,10 +27,10 @@ def loss_function(model, graph, noise):
         if perturbed_batch is None:
             perturbed_batch = graph.sample_transition(batch, sigma[:, None])
 
-        z, log_score = model(z, perturbed_batch, sigma)
+        z, log_score, aux_loss = model(z, perturbed_batch, sigma)
         loss = graph.score_entropy(log_score, sigma[:, None], perturbed_batch, batch)
         loss = (dsigma[:, None] * loss).sum(dim=-1)
 
-        return loss.mean(), tuple(zi.detach() for zi in z)
+        return loss.mean() + aux_loss, tuple(zi.detach() for zi in z)
 
     return sedd_hrm_loss

@@ -326,7 +326,7 @@ def make_score_fn(model, device):
         x = x.to(device)
         sigma = sigma.to(device)
         z = tuple(zi.to(device) for zi in z)
-        z, log_score = model(z, x, sigma)
+        z, log_score, _aux = model(z, x, sigma)
         return z, log_score
     return score_fn
 
