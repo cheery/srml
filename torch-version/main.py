@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from model import SRLM, SRLMConfig, make_z, AbsorbingGraph, LogLinearNoise, Sampler, loss_function
+from model import SRLM, SRLMConfig, make_z, AbsorbingGraph, LogLinearNoise, Sampler, loss_function, MemoryBank
 from wiki_data import WikiDataLoader
 
 # ---------------------------------------------------------------------------
@@ -320,13 +320,13 @@ class QAProgram:
 # Score function wrapper for sampler
 # ---------------------------------------------------------------------------
 
-def make_score_fn(model, device):
+def make_score_fn(model, device, memories=None):
     @torch.no_grad()
     def score_fn(z, x, sigma):
         x = x.to(device)
         sigma = sigma.to(device)
         z = tuple(zi.to(device) for zi in z)
-        z, log_score, _aux = model(z, x, sigma)
+        z, log_score, _aux = model(z, x, sigma, memories=memories)
         return z, log_score
     return score_fn
 
@@ -335,12 +335,12 @@ def make_score_fn(model, device):
 # ---------------------------------------------------------------------------
 
 def make_train_step(model, optimizer, loss_fn, device):
-    def train_step(z, batch, perturbed_batch=None):
+    def train_step(z, batch, perturbed_batch=None, memories=None):
         batch = batch.to(device)
         if perturbed_batch is not None:
             perturbed_batch = perturbed_batch.to(device)
         optimizer.zero_grad()
-        loss, z = loss_fn(z, batch, perturbed_batch=perturbed_batch)
+        loss, z = loss_fn(z, batch, perturbed_batch=perturbed_batch, memories=memories)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 0.1)
         optimizer.step()
@@ -427,10 +427,27 @@ def cmd_train(args):
     ckpt_path.mkdir(parents=True, exist_ok=True)
     loss_fd = open(ckpt_path / "loss.txt", "w")
 
-    # Scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+    # Scheduler: linear warmup then cosine decay
+    warmup_steps = args.warmup_steps
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(save_every, 1000), eta_min=1e-6
     )
+    if warmup_steps > 0:
+        warmup_scheduler = optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-2, end_factor=1.0, total_iters=warmup_steps
+        )
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_steps]
+        )
+    else:
+        scheduler = cosine_scheduler
+
+    # Memory bank (Anki-style rolling recall)
+    use_memory = args.memory_size > 0
+    if use_memory:
+        memory_bank = MemoryBank()
+        print(f"Memory bank: size={args.memory_size}, k={args.memory_k}, refresh every {args.memory_refresh}")
 
     print(f"Training | programs: {[p.description() for p in programs]}")
     print("-" * 55)
@@ -464,11 +481,34 @@ def cmd_train(args):
                 continue
             batch, perturbed_batch = result
 
-            # Run supervision steps on the same batch
+            # Store this batch in the memory bank
+            if use_memory:
+                model.eval()
+                memory_bank.encode(model, [batch], device)
+                model.train()
+                # Drop oldest if over capacity
+                while len(memory_bank) > args.memory_size:
+                    memory_bank.tokens.pop(0)
+                    memory_bank.memories.pop(0)
+                    memory_bank.summaries.pop(0)
+
+            # Anki: randomly replay a past batch, retrieve relevant memories
+            if use_memory and len(memory_bank) >= args.memory_k + 1:
+                idx = torch.randint(0, len(memory_bank), ()).item()
+                batch = memory_bank.tokens[idx].to(device)
+                perturbed_batch = None
+                # Route to find relevant memories (target's own memory will score high)
+                with torch.no_grad():
+                    query = model.input.input_emb(batch.clamp(0, config.vocab_size - 1))
+                memories = memory_bank.retrieve(query, args.memory_k)
+            else:
+                memories = None
+
+            # Run supervision steps
             z = make_z(batch_size, seq_len, config.d_model, device=device)
             session_loss = 0.0
             for _ in range(supervision):
-                loss, z = train_step(z, batch, perturbed_batch)
+                loss, z = train_step(z, batch, perturbed_batch, memories=memories)
                 session_loss += loss
 
             avg_session = session_loss / supervision
@@ -484,8 +524,15 @@ def cmd_train(args):
 
             if global_step % report_every == 0:
                 avg = running_loss / report_every
-                print(f"  step {global_step:6d} | loss {avg:.4f} | lr {scheduler.get_last_lr()[0]:.2e}")
+                mem_info = f" | mem {len(memory_bank)}" if use_memory else ""
+                print(f"  step {global_step:6d} | loss {avg:.4f} | lr {scheduler.get_last_lr()[0]:.2e}{mem_info}")
                 running_loss = 0.0
+
+            # Periodic memory refresh — re-encode with improved model
+            if use_memory and global_step % args.memory_refresh == 0 and len(memory_bank) > 0:
+                model.eval()
+                memory_bank.refresh(model, device)
+                model.train()
 
             if global_step % save_every == 0:
                 wiki_state = None
@@ -621,6 +668,14 @@ def main():
                          help="Sequence length (default: from config)")
     p_train.add_argument("--lr", type=float, default=1e-4,
                          help="Learning rate (default: 1e-4)")
+    p_train.add_argument("--warmup-steps", type=int, default=100, dest="warmup_steps",
+                         help="Linear LR warmup steps (default: 100)")
+    p_train.add_argument("--memory-size", type=int, default=0, dest="memory_size",
+                         help="Rolling memory bank size (0 = disabled, default: 0)")
+    p_train.add_argument("--memory-k", type=int, default=2, dest="memory_k",
+                         help="Number of memories to retrieve per step (default: 2)")
+    p_train.add_argument("--memory-refresh", type=int, default=100, dest="memory_refresh",
+                         help="Re-encode memory bank every N steps (default: 100)")
 
     # --- eval ---
     p_eval = sub.add_parser("eval", help="Interactive evaluation")

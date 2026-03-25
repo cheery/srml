@@ -109,7 +109,56 @@ class SRLM(nn.Module):
         self.norm      = AdaLN(cfg.d_model)
         self.output    = OutputLayer(cfg)
 
-    def forward(self, z, x, sigma):
+    @torch.no_grad()
+    def encode_document(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Encode a document into a compressed memory block.
+
+        Runs tokens through input + prior layers (at sigma=0, i.e. clean text),
+        then pools to a fixed-size representation that matches (B, L, D) shape
+        for compatibility with the block list.
+
+        Args:
+            tokens: (B, L_doc) int tensor — document token IDs.
+                    Long documents are split into context_length chunks,
+                    encoded separately, and averaged.
+        Returns:
+            memory: (B, L, D) — compressed document representation,
+                    where L = cfg.context_length
+        """
+        B = tokens.shape[0]
+        L = self.cfg.context_length
+        L_doc = tokens.shape[1]
+        sigma = torch.zeros(B, device=tokens.device)
+
+        if L_doc <= L:
+            # Short doc: pad to context_length, encode, pool if needed
+            if L_doc < L:
+                tokens = F.pad(tokens, (0, L - L_doc), value=0)
+            q, p, t = self.input(tokens, sigma)
+            blocks = [q]
+            for layer in self.prior:
+                h = self.block_res(blocks)
+                y = layer(h, p, t)
+                blocks.append(y)
+            return self.block_res(blocks)
+
+        # Long doc: split into chunks, encode each, average
+        chunks = [tokens[:, i:i+L] for i in range(0, L_doc, L)]
+        # Pad last chunk if needed
+        if chunks[-1].shape[1] < L:
+            chunks[-1] = F.pad(chunks[-1], (0, L - chunks[-1].shape[1]), value=0)
+        encoded = []
+        for chunk in chunks:
+            q, p, t = self.input(chunk, sigma)
+            blocks = [q]
+            for layer in self.prior:
+                h = self.block_res(blocks)
+                y = layer(h, p, t)
+                blocks.append(y)
+            encoded.append(self.block_res(blocks))
+        return torch.stack(encoded).mean(dim=0)  # (B, L, D)
+
+    def forward(self, z, x, sigma, memories=None):
         q, p, t = self.input(x, sigma)
         blocks = [q]
 
@@ -121,6 +170,10 @@ class SRLM(nn.Module):
         h = self.block_res(blocks)
         z, y = self.main(z, h, p, t)
         blocks.append(y)
+
+        # Append external memories — router scores them alongside pipeline blocks
+        if memories is not None:
+            blocks.extend(memories)
 
         aux_routing_losses = []
         for layer, router in zip(self.posterior, self.routers):
