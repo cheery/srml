@@ -28,7 +28,7 @@ VOCAB_SIZE  = 256
 TOTAL_VOCAB = 257
 
 B                  = 32
-SEQ_LEN            = 32
+SEQ_LEN            = 256
 N_STEPS            = 500
 STEP_REPORT_EVERY  = 10
 SUPERVISION        = 5
@@ -261,44 +261,49 @@ if __name__ == "__main__":
         print(f"Training SRLM | d_model={config.d_model}, d_state={config.d_state}")
         print("-" * 55)
 
-        for epoch in range(5000):
-            # Sample inference
-            z = make_z(1, SEQ_LEN, config.d_model, device=device)
-            prefix = from_text("Vaka vanha").to(device)
-            def projector(x):
-                x[:, :len(prefix)] = prefix
-                return x
-            _, outputs = sampler.sample(
-                score_fn, z, graph, noise,
-                tokenizer=as_text,
-                batch_size=1,
-                batch_len=SEQ_LEN,
-                steps=10,
-                projector=projector,
-                device=device,
-            )
-            print(repr(outputs[0]))
+        with open(cwd / "loss.txt", "w") as loss_fd:
+            global_step = 0
+            for epoch in range(5000):
+                # Sample inference
+                z = make_z(1, SEQ_LEN, config.d_model, device=device)
+                prefix = from_text("Vaka vanha").to(device)
+                def projector(x):
+                    x[:, :len(prefix)] = prefix
+                    return x
+                _, outputs = sampler.sample(
+                    score_fn, z, graph, noise,
+                    tokenizer=as_text,
+                    batch_size=1,
+                    batch_len=SEQ_LEN,
+                    steps=10,
+                    projector=projector,
+                    device=device,
+                )
+                print(repr(outputs[0]))
 
-            total_loss = 0.0
-            for step in range(N_STEPS):
-                batch = sample_batch_random(raw, SEQ_LEN, B)
-                z = make_z(B, SEQ_LEN, config.d_model, device=device)
-                session_loss = 0.0
-                for _ in range(SUPERVISION):
-                    loss, z = train_step(z, batch)
-                    session_loss += loss
-                    total_loss   += loss
+                total_loss = 0.0
+                for step in range(N_STEPS):
+                    batch = sample_batch_random(raw, SEQ_LEN, B)
+                    z = make_z(B, SEQ_LEN, config.d_model, device=device)
+                    session_loss = 0.0
+                    for _ in range(SUPERVISION):
+                        loss, z = train_step(z, batch)
+                        session_loss += loss
+                        total_loss   += loss
+                    loss_fd.write(f"{global_step} {session_loss/SUPERVISION}\n")
+                    loss_fd.flush()
+                    global_step += 1
 
-                if step % STEP_REPORT_EVERY == 0:
-                    print(f"  step {step:4d} | loss {session_loss/SUPERVISION:.4f}")
-                if math.isnan(loss):
-                    print("Training failed — NaN loss")
-                    sys.exit(1)
+                    if step % STEP_REPORT_EVERY == 0:
+                        print(f"  step {step:4d} | loss {session_loss/SUPERVISION:.4f}")
+                    if math.isnan(loss):
+                        print("Training failed — NaN loss")
+                        sys.exit(1)
 
-                scheduler.step()
+                    scheduler.step()
 
-            avg = total_loss / (N_STEPS * SUPERVISION)
-            print(f"epoch {epoch+1}, avg loss {avg:.4f}")
-            save_checkpoint(model, optimizer, cwd / f"{checkpoint_name}_{epoch+1}")
+                avg = total_loss / (N_STEPS * SUPERVISION)
+                print(f"epoch {epoch+1}, avg loss {avg:.4f}")
+                save_checkpoint(model, optimizer, cwd / f"{checkpoint_name}_{epoch+1}")
 
         print("Done.")
