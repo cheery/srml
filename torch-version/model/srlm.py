@@ -16,6 +16,7 @@ class SRLMConfig:
     d_frequency_embedding: int = 256
     N:                     int = 2
     T:                     int = 4
+    dropout:               float = 0.1
 
 class BlockAttnRes(nn.Module):
     """Block attention residual: weighted combination over all accumulated blocks."""
@@ -39,12 +40,12 @@ class SRLM(nn.Module):
         self.cfg = cfg
         self.input     = InputLayer(cfg)
         self.prior     = nn.ModuleList([
-            DiTBlock(cfg.d_model, cfg.d_model, cfg.n_heads, mlp_ratio=4.0)
+            DiTBlock(cfg.d_model, cfg.d_model, cfg.n_heads, mlp_ratio=4.0, dropout=cfg.dropout)
             for _ in range(cfg.n_priors)
         ])
         self.main      = HRM(cfg)
         self.posterior = nn.ModuleList([
-            DiTBlock(cfg.d_model, cfg.d_model, cfg.n_heads, mlp_ratio=4.0)
+            DiTBlock(cfg.d_model, cfg.d_model, cfg.n_heads, mlp_ratio=4.0, dropout=cfg.dropout)
             for _ in range(cfg.n_posteriors)
         ])
         self.block_res = BlockAttnRes(cfg.d_model)
@@ -101,14 +102,15 @@ class FastLayer(nn.Module):
         self.normL = AdaLN(cfg.d_model)
         self.normX = AdaLN(cfg.d_model)
         self.inj   = nn.Linear(cfg.d_model * 3, cfg.d_model)
-        self.s5d   = DiTBlock(cfg.d_model, cfg.d_model, num_heads=cfg.n_heads, mlp_ratio=4.0)
+        self.drop  = nn.Dropout(cfg.dropout)
+        self.s5d   = DiTBlock(cfg.d_model, cfg.d_model, num_heads=cfg.n_heads, mlp_ratio=4.0, dropout=cfg.dropout)
 
     def forward(self, zH: torch.Tensor, zL: torch.Tensor, x: torch.Tensor, p: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         zH = self.normH(zH, t)
         zL = self.normL(zL, t)
         x  = self.normX(x, t)
         x = torch.cat([zH, zL, x], dim=-1)  # (B, L, 3*D)
-        x = self.inj(x)                      # (B, L, D)
+        x = self.drop(self.inj(x))           # (B, L, D)
         x = self.s5d(x, p, t)
         return x
 
@@ -119,13 +121,14 @@ class SlowLayer(nn.Module):
         self.normH = AdaLN(cfg.d_model)
         self.normL = AdaLN(cfg.d_model)
         self.inj   = nn.Linear(cfg.d_model * 2, cfg.d_model)
-        self.s5d   = DiTBlock(cfg.d_model, cfg.d_model, num_heads=cfg.n_heads, mlp_ratio=4.0)
+        self.drop  = nn.Dropout(cfg.dropout)
+        self.s5d   = DiTBlock(cfg.d_model, cfg.d_model, num_heads=cfg.n_heads, mlp_ratio=4.0, dropout=cfg.dropout)
 
     def forward(self, zH: torch.Tensor, zL: torch.Tensor, p: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         zH = self.normH(zH, t)
         zL = self.normL(zL, t)
         x = torch.cat([zH, zL], dim=-1)  # (B, L, 2*D)
-        x = self.inj(x)
+        x = self.drop(self.inj(x))
         x = self.s5d(x, p, t)
         return x
 
@@ -158,18 +161,16 @@ class InputLayer(nn.Module):
 class OutputLayer(nn.Module):
     def __init__(self, cfg: SRLMConfig):
         super().__init__()
-        #self.ff   = FeedForward(cfg.d_model)
         self.mlp = nn.Sequential(
             nn.Linear(cfg.d_model, cfg.d_model*4, bias=True),
-            nn.GELU(approximate="tanh"), # Or nn.SiLU()
+            nn.GELU(approximate="tanh"),
+            nn.Dropout(cfg.dropout),
             nn.Linear(cfg.d_model*4, cfg.d_model, bias=True),
         )
         self.proj = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
 
     def forward(self, x: torch.Tensor, y: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        #y = self.ff(y)
         y = self.mlp(y)
-            #y = F.dropout(y, p=0.1, training=True)
         y = self.proj(y)
         return scatter(x, y, sigma)
 
@@ -202,7 +203,7 @@ class DiTBlock(nn.Module):
     """
     A standard DiT block with adaLN-Zero modulation.
     """
-    def __init__(self, hidden_dim: int, embedding_dim: int, num_heads: int, mlp_ratio: float = 4.0):
+    def __init__(self, hidden_dim: int, embedding_dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.1):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
@@ -217,16 +218,17 @@ class DiTBlock(nn.Module):
         self.num_heads = num_heads
         self.qkv = nn.Linear(embedding_dim, 3 * hidden_dim, bias=True)
         self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=True)
-        # Attention layer
-        #self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
 
         # MLP layer
         mlp_hidden_dim = int(hidden_dim * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, mlp_hidden_dim, bias=True),
-            nn.GELU(approximate="tanh"), # Or nn.SiLU()
+            nn.GELU(approximate="tanh"),
             nn.Linear(mlp_hidden_dim, hidden_dim, bias=True),
         )
+
+        self.drop_attn = nn.Dropout(dropout)
+        self.drop_mlp  = nn.Dropout(dropout)
 
     def forward(self, x, p, c):
         # x shape: [batch_size, num_patches, hidden_dim]
@@ -253,9 +255,8 @@ class DiTBlock(nn.Module):
         attn_output = F.scaled_dot_product_attention(q, k, v)
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, H)
         attn_output = self.out_proj(attn_output)
-        #attn_output, _ = self.attn(x_modulated1, x_modulated1, x_modulated1)
-        # Apply gating and add residual connection
-        x = x + gate_msa * attn_output
+        # Apply gating, dropout, and add residual connection
+        x = x + gate_msa * self.drop_attn(attn_output)
 
         # --- Apply adaLN-Zero before MLP ---
         x_norm2 = self.norm2(x)
@@ -263,8 +264,8 @@ class DiTBlock(nn.Module):
         x_modulated2 = x_norm2 * (1 + scale_mlp) + shift_mlp
         # Apply MLP
         mlp_output = self.mlp(x_modulated2)
-        # Apply gating and add residual connection
-        x = x + gate_mlp * mlp_output
+        # Apply gating, dropout, and add residual connection
+        x = x + gate_mlp * self.drop_mlp(mlp_output)
 
         # Output shape: [batch_size, num_patches, hidden_dim]
         return x
