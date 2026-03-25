@@ -85,55 +85,68 @@ def render(points, width=64, height=32, title=None):
     # grid[row][col] = character to draw
     grid = [[" "] * plot_w for _ in range(plot_h)]
 
-    # For line chart: compute sub-row for each column, interpolating between points
-    # First map all data points to columns
-    col_values = {}   # col -> list of y values landing there
-    for x, y in points:
-        c = x_to_col(x)
-        col_values.setdefault(c, []).append(y)
-
-    # Interpolate to fill all columns
-    # Sort points by x
+    # Bucket data points into columns, computing min/max y per column.
+    # When more points than columns, this shows the full range.
     sorted_pts = sorted(points, key=lambda p: p[0])
 
-    col_y = {}  # col -> interpolated y
-    for i in range(plot_w):
-        # Find x value corresponding to this column
-        x = x_min + (x_max - x_min) * i / max(plot_w - 1, 1)
-        # Linear interpolation
-        # Find surrounding points
-        lo_pt = sorted_pts[0]
-        hi_pt = sorted_pts[-1]
-        for j in range(len(sorted_pts) - 1):
-            if sorted_pts[j][0] <= x <= sorted_pts[j+1][0]:
-                lo_pt = sorted_pts[j]
-                hi_pt = sorted_pts[j+1]
-                break
-        if hi_pt[0] == lo_pt[0]:
-            y_interp = lo_pt[1]
-        else:
-            t = (x - lo_pt[0]) / (hi_pt[0] - lo_pt[0])
-            y_interp = lo_pt[1] + t * (hi_pt[1] - lo_pt[1])
-        col_y[i] = y_interp
+    # col_range[col] = (min_y, max_y)
+    col_range = {}
 
-    # Draw filled area: for each column, fill from bottom up to the data value
-    for col, y in col_y.items():
-        sub = y_to_sub(y)
-        sub = max(0, min(total_sub, sub))
-        full_rows = int(sub) // 8
-        partial   = int(sub) % 8
+    if len(points) <= plot_w:
+        # Fewer points than columns: interpolate as before
+        for i in range(plot_w):
+            x = x_min + (x_max - x_min) * i / max(plot_w - 1, 1)
+            lo_pt = sorted_pts[0]
+            hi_pt = sorted_pts[-1]
+            for j in range(len(sorted_pts) - 1):
+                if sorted_pts[j][0] <= x <= sorted_pts[j+1][0]:
+                    lo_pt = sorted_pts[j]
+                    hi_pt = sorted_pts[j+1]
+                    break
+            if hi_pt[0] == lo_pt[0]:
+                y_interp = lo_pt[1]
+            else:
+                t = (x - lo_pt[0]) / (hi_pt[0] - lo_pt[0])
+                y_interp = lo_pt[1] + t * (hi_pt[1] - lo_pt[1])
+            col_range[i] = (y_interp, y_interp)
+    else:
+        # More points than columns: bucket and take min/max per column
+        for x, y in points:
+            c = x_to_col(x)
+            if c in col_range:
+                lo, hi = col_range[c]
+                col_range[c] = (min(lo, y), max(hi, y))
+            else:
+                col_range[c] = (y, y)
 
-        # Fill full rows from bottom
-        for r in range(full_rows):
+    # color grid: 0 = no fill, 1 = solid (below min), 2 = range band (min..max)
+    color_grid = [[0] * plot_w for _ in range(plot_h)]
+
+    for col, (y_min_col, y_max_col) in col_range.items():
+        sub_lo = max(0, min(total_sub, y_to_sub(y_min_col)))
+        sub_hi = max(0, min(total_sub, y_to_sub(y_max_col)))
+
+        # Fill from bottom to max
+        full_rows_hi = int(sub_hi) // 8
+        partial_hi   = int(sub_hi) % 8
+
+        # The min boundary (below this is solid, above is range band)
+        full_rows_lo = int(sub_lo) // 8
+        partial_lo   = int(sub_lo) % 8
+
+        # Fill full rows from bottom up to max
+        for r in range(full_rows_hi):
             row = plot_h - 1 - r
             if 0 <= row < plot_h:
                 grid[row][col] = "█"
+                color_grid[row][col] = 1 if r < full_rows_lo else 2
 
-        # Partial row
-        if partial > 0:
-            row = plot_h - 1 - full_rows
+        # Partial row at max
+        if partial_hi > 0:
+            row = plot_h - 1 - full_rows_hi
             if 0 <= row < plot_h:
-                grid[row][col] = EIGHTHS[partial]
+                grid[row][col] = EIGHTHS[partial_hi]
+                color_grid[row][col] = 2 if full_rows_hi >= full_rows_lo else 1
 
     # Build y-axis tick labels (4 ticks)
     n_ticks = 4
@@ -162,11 +175,16 @@ def render(points, width=64, height=32, title=None):
         axis = "│"
 
         # Plot content with color
+        # Blue (34) for solid fill below min, cyan (36) for min..max range band
         content = ""
         for col in range(plot_w):
             ch = grid[row][col]
             if ch != " ":
-                content += f"\033[34m{ch}\033[0m"
+                c = color_grid[row][col]
+                if c == 2:
+                    content += f"\033[36m{ch}\033[0m"
+                else:
+                    content += f"\033[34m{ch}\033[0m"
             else:
                 content += ch
 

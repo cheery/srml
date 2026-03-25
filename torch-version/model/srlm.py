@@ -10,7 +10,6 @@ class SRLMConfig:
     vocab_size:            int
     context_length:        int
     d_model:               int
-    d_state:               int
     n_priors:              int
     n_posteriors:          int
     n_heads:               int
@@ -18,39 +17,61 @@ class SRLMConfig:
     N:                     int = 2
     T:                     int = 4
 
+class BlockAttnRes(nn.Module):
+    """Block attention residual: weighted combination over all accumulated blocks."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.norm = nn.RMSNorm(d_model)
+        self.proj = nn.Linear(d_model, 1, bias=False)
+
+    def forward(self, blocks: list[torch.Tensor]) -> torch.Tensor:
+        V = torch.stack(blocks)           # (N, B, L, D)
+        K = self.norm(V)
+        logits = torch.einsum('d, n b t d -> n b t', self.proj.weight.squeeze(), K)
+        h = torch.einsum('n b t, n b t d -> b t d', logits.softmax(0), V)
+        return h
+
+
 class SRLM(nn.Module):
     def __init__(self, cfg: SRLMConfig):
         super().__init__()
         self.cfg = cfg
         self.input     = InputLayer(cfg)
-        self.prior     = S5Stack(cfg, cfg.n_priors)
+        self.prior     = nn.ModuleList([
+            DiTBlock(cfg.d_model, cfg.d_model, cfg.n_heads, mlp_ratio=4.0)
+            for _ in range(cfg.n_priors)
+        ])
         self.main      = HRM(cfg)
-        self.posterior = S5Stack(cfg, cfg.n_posteriors)
-        #self.norm      = AdaLN(cfg.d_model)
+        self.posterior = nn.ModuleList([
+            DiTBlock(cfg.d_model, cfg.d_model, cfg.n_heads, mlp_ratio=4.0)
+            for _ in range(cfg.n_posteriors)
+        ])
+        self.block_res = BlockAttnRes(cfg.d_model)
+        self.norm      = AdaLN(cfg.d_model)
         self.output    = OutputLayer(cfg)
 
     def forward(self, z, x, sigma):
         q, p, t = self.input(x, sigma)
-        y = self.prior(q, p, t)
-        z, y = self.main(z, y, p, t)
-        y = self.posterior(y, p, t)
-        #y = self.norm(y, t)
+        blocks = [q]
+
+        for layer in self.prior:
+            h = self.block_res(blocks)
+            y = layer(h, p, t)
+            blocks.append(y)
+
+        h = self.block_res(blocks)
+        z, y = self.main(z, h, p, t)
+        blocks.append(y)
+
+        for layer in self.posterior:
+            h = self.block_res(blocks)
+            y = layer(h, p, t)
+            blocks.append(y)
+
+        h = self.block_res(blocks)
+        y = self.norm(h, t)
         return z, self.output(x, y, sigma)
-        #return z, self.output(x, y, sigma)
-
-
-class S5Stack(nn.Module):
-    def __init__(self, cfg: SRLMConfig, n_layers: int):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            DiTBlock(cfg.d_model, cfg.d_model, cfg.n_heads, mlp_ratio = 4.0) for _ in range(n_layers)
-        ])
-
-    def forward(self, y, p, t) -> torch.Tensor:
-        for layer in self.layers:
-            y = layer(y, p, t)
-                #residual = F.dropout(y, p=0.1, training=True)
-        return y
 
 class HRM(nn.Module):
     def __init__(self, cfg: SRLMConfig):
@@ -76,14 +97,16 @@ class HRM(nn.Module):
 class FastLayer(nn.Module):
     def __init__(self, cfg: SRLMConfig):
         super().__init__()
-        #self.normH = AdaLN(cfg.d_model)
-        #self.normL = AdaLN(cfg.d_model)
+        self.normH = AdaLN(cfg.d_model)
+        self.normL = AdaLN(cfg.d_model)
+        self.normX = AdaLN(cfg.d_model)
         self.inj   = nn.Linear(cfg.d_model * 3, cfg.d_model)
         self.s5d   = DiTBlock(cfg.d_model, cfg.d_model, num_heads=cfg.n_heads, mlp_ratio=4.0)
 
     def forward(self, zH: torch.Tensor, zL: torch.Tensor, x: torch.Tensor, p: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        #zH = self.normH(zH, t)
-        #zL = self.normL(zL, t)
+        zH = self.normH(zH, t)
+        zL = self.normL(zL, t)
+        x  = self.normX(x, t)
         x = torch.cat([zH, zL, x], dim=-1)  # (B, L, 3*D)
         x = self.inj(x)                      # (B, L, D)
         x = self.s5d(x, p, t)
@@ -93,22 +116,17 @@ class FastLayer(nn.Module):
 class SlowLayer(nn.Module):
     def __init__(self, cfg: SRLMConfig):
         super().__init__()
-        #self.normH = AdaLN(cfg.d_model)
-        #self.normL = AdaLN(cfg.d_model)
+        self.normH = AdaLN(cfg.d_model)
+        self.normL = AdaLN(cfg.d_model)
         self.inj   = nn.Linear(cfg.d_model * 2, cfg.d_model)
         self.s5d   = DiTBlock(cfg.d_model, cfg.d_model, num_heads=cfg.n_heads, mlp_ratio=4.0)
-        #self.s5d   = nn.TransformerEncoderLayer(cfg.d_model, cfg.n_heads,
-        #                                        dim_feedforward=cfg.d_model*3,
-        #                                        dropout = 0.1)
-        #self.proj  = nn.Linear(cfg.d_model * 2, cfg.d_model)
 
     def forward(self, zH: torch.Tensor, zL: torch.Tensor, p: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        #zH = self.normH(zH, t)
-        #zL = self.normL(zL, t)
+        zH = self.normH(zH, t)
+        zL = self.normL(zL, t)
         x = torch.cat([zH, zL], dim=-1)  # (B, L, 2*D)
         x = self.inj(x)
         x = self.s5d(x, p, t)
-        #x = self.proj(x)
         return x
 
 
@@ -169,16 +187,16 @@ class FeedForward(nn.Module):
         return self.pos(F.gelu(self.pre(x)))
 
 
-#class AdaLN(nn.Module):
-#    def __init__(self, d_model: int):
-#        super().__init__()
-#        self.norm = nn.LayerNorm(d_model, elementwise_affine=False)
-#        self.proj = nn.Linear(d_model, 2 * d_model)
-#
-#    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-#        # x: (B, L, D), cond: (B, D)
-#        scale, shift = self.proj(cond).chunk(2, dim=-1)  # each (B, D)
-#        return self.norm(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+class AdaLN(nn.Module):
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.proj = nn.Linear(d_model, 2 * d_model)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        # x: (B, L, D), cond: (B, D)
+        scale, shift = self.proj(cond).chunk(2, dim=-1)  # each (B, D)
+        return self.norm(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 class DiTBlock(nn.Module):
     """
