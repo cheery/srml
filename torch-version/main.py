@@ -950,6 +950,8 @@ def cmd_eval(args):
 
 def main():
     parser = argparse.ArgumentParser(description="SRLM training and evaluation")
+    parser.add_argument("--tf32", action="store_true",
+                        help="Set float32 matmul precision to 'high' (use TF32 on Ampere+)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # --- train ---
@@ -1042,6 +1044,9 @@ def main():
                         help="Number of memories to retrieve per query")
 
     args = parser.parse_args()
+    if args.tf32:
+        torch.set_float32_matmul_precision('high')
+        print("TF32 matmul precision enabled")
     if args.command == "train":
         cmd_train(args)
     elif args.command == "eval":
