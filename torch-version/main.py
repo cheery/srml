@@ -652,6 +652,7 @@ def cmd_train(args):
                 grpo_loss, z, grpo_metrics = grpo_step(
                     model, optimizer, loss_fn, Sampler(), graph, noise,
                     grpo_prompt, batch.to(device), reward_fn, z, device,
+                    memories=memories,
                     K=args.grpo_k,
                     sampling_steps=args.grpo_steps,
                     verbose=args.print_grpo,

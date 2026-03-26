@@ -134,6 +134,7 @@ def grpo_step(
     z,                   # HRM state
     device,
     verbose=False,       # print prompts, samples, rewards
+    memories=None,       # optional memory tensors for model
     K=4,                 # candidates per prompt
     sampling_steps=50,   # diffusion steps for generation
     grad_clip=0.1,
@@ -181,6 +182,12 @@ def grpo_step(
 
     def projector(x):
         return torch.where(visible_mask, visible_values, x)
+
+    # Expand memories to match B*K batch size for generation
+    memories_expanded = None
+    if memories is not None:
+        memories_expanded = [m.repeat_interleave(K, dim=0) for m in memories]
+
     x = graph.sample_limit(B * K, L, device=device)
     eps = 1e-5
     timesteps = torch.linspace(1.0, eps, sampling_steps + 1, device=device)
@@ -192,7 +199,7 @@ def grpo_step(
             t = timesteps[i].expand(B * K)
             x = projector(x)
             sigma, dsigma = noise(t)
-            z_gen, log_score, _ = model(z_gen, x, sigma)
+            z_gen, log_score, _ = model(z_gen, x, sigma, memories=memories_expanded)
             score = log_score.exp()
             rev_rate = dt * dsigma[..., None, None] * graph.reverse_rate(x, score)
             x = graph.sample_rate(x, rev_rate)
@@ -261,7 +268,7 @@ def grpo_step(
         vis = (prompt_batch.to(device) != MASK_TOKEN)
         perturbed = torch.where(vis, clean_batch.to(device), perturbed)
         z_k = tuple(zi[:B].detach() for zi in z) if z[0].shape[0] >= B else z
-        z_k, log_score, aux_loss = model(z_k, perturbed, sigma)
+        z_k, log_score, aux_loss = model(z_k, perturbed, sigma, memories=memories)
         loss_per_pos = graph.score_entropy(log_score, sigma[:, None], perturbed, clean_batch.to(device))
         fallback_loss = (dsigma[:, None] * loss_per_pos).sum(dim=-1).mean() + aux_loss
         fallback_loss.backward()
@@ -284,7 +291,7 @@ def grpo_step(
             perturbed = torch.where(vis, candidate_k, perturbed)
 
             z_k = tuple(zi[:B].detach() for zi in z) if z[0].shape[0] >= B else z
-            z_k, log_score, aux_loss = model(z_k, perturbed, sigma)
+            z_k, log_score, aux_loss = model(z_k, perturbed, sigma, memories=memories)
             loss_per_pos = graph.score_entropy(log_score, sigma[:, None], perturbed, candidate_k)
             loss_per_sample = (dsigma[:, None] * loss_per_pos).sum(dim=-1)  # (B,)
 
