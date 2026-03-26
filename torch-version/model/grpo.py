@@ -137,7 +137,8 @@ def grpo_step(
     memories=None,       # optional memory tensors for model
     K=4,                 # candidates per prompt
     sampling_steps=50,   # diffusion steps for generation
-    grad_clip=0.1,
+    grad_clip=1.0,
+    epochs=5,
 ):
     """One GRPO update step.
 
@@ -238,43 +239,21 @@ def grpo_step(
                 print(f"        k={k}: {repr(gen_str):40s} reward={r:.3f}")
         print()
 
-    # --- 3. Group-relative advantages ---
+    # --- 3. Group-relative advantages (z-score per group) ---
     rewards_grouped = rewards.view(B, K)
     mean_r = rewards_grouped.mean(dim=1, keepdim=True)
     std_r = rewards_grouped.std(dim=1, keepdim=True)
-    # When all candidates have same reward, advantage is 0 (no signal).
-    # Use raw centered rewards as fallback when std is tiny.
-    has_variance = (std_r > 1e-4).float()
-    safe_std = std_r.clamp(min=1e-4)
-    advantages = ((rewards_grouped - mean_r) / safe_std * has_variance).view(B * K)
+    advantages = (rewards_grouped - mean_r) / (std_r + 1e-4)
+    advantages = advantages.view(B * K)
 
-    # If no group has variance (all rewards identical), fall back to
-    # regular SEDD loss on the best candidate (or clean target)
-    any_signal = (advantages.abs() > 1e-6).any().item()
-
-    # --- 4. Weighted SEDD loss ---
+    # --- 4. Advantage-weighted SEDD loss on generated candidates ---
     model.train()
-    optimizer.zero_grad()
 
+    # Process all K candidates, accumulate gradients
     total_loss = 0.0
-    n_pos = 0
-
-    if not any_signal:
-        # No RL signal — fall back to regular SEDD on clean target
-        sampling_eps = 1e-3
-        t = ((1 - sampling_eps) * torch.rand(B, device=device) + sampling_eps)
-        sigma, dsigma = noise(t)
-        perturbed = graph.sample_transition(clean_batch.to(device), sigma[:, None])
-        vis = (prompt_batch.to(device) != MASK_TOKEN)
-        perturbed = torch.where(vis, clean_batch.to(device), perturbed)
-        z_k = tuple(zi[:B].detach() for zi in z) if z[0].shape[0] >= B else z
-        z_k, log_score, aux_loss = model(z_k, perturbed, sigma, memories=memories)
-        loss_per_pos = graph.score_entropy(log_score, sigma[:, None], perturbed, clean_batch.to(device))
-        fallback_loss = (dsigma[:, None] * loss_per_pos).sum(dim=-1).mean() + aux_loss
-        fallback_loss.backward()
-        total_loss = fallback_loss.item()
-        n_pos = 1
-    else:
+    for _ in range(epochs):
+        optimizer.zero_grad()
+        n_tokens = 0
         for k in range(K):
             idx = torch.arange(B, device=device) * K + k
             candidate_k = generated[idx.cpu()].to(device)   # (B, L)
@@ -295,19 +274,30 @@ def grpo_step(
             loss_per_pos = graph.score_entropy(log_score, sigma[:, None], perturbed, candidate_k)
             loss_per_sample = (dsigma[:, None] * loss_per_pos).sum(dim=-1)  # (B,)
 
-            # Weight by advantage
-            weighted_loss = (loss_per_sample * advantage_k).mean()
-            weighted_loss = weighted_loss + aux_loss
-            weighted_loss.backward()
+            # score_entropy * advantage (no negation — score_entropy is positive,
+            # unlike autoregressive log_prob which is negative)
+            # Positive advantage → minimize score_entropy (reinforce this candidate)
+            # Negative advantage → maximize score_entropy (push away from bad candidate)
+            weighted_loss = (loss_per_sample * advantage_k).sum()
+            # Normalize by total tokens across all K candidates
+            n_masked = (~vis).sum().item()
+            n_tokens += max(n_masked, 1)
 
+            # aux_loss minimized unconditionally (not weighted by advantage)
+            (weighted_loss + aux_loss).backward()
             total_loss += weighted_loss.item()
-            n_pos += 1
 
-    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    optimizer.step()
+        # Normalize accumulated gradients by total token count
+        if n_tokens > 0:
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.div_(n_tokens)
 
-    # Update z from the last forward pass
-    z_out = tuple(zi.detach() for zi in z_k)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+
+        # Update z from the last forward pass
+        z_out = tuple(zi.detach() for zi in z_k)
 
     metrics = {
         'mean_reward': rewards.mean().item(),
@@ -317,7 +307,7 @@ def grpo_step(
         'frac_correct': (rewards > 0.5).float().mean().item(),
     }
 
-    return total_loss / max(n_pos, 1), z_out, metrics
+    return total_loss / max(n_tokens, 1), z_out, metrics
 
 
 def make_z_for_grpo(batch_size, seq_len, d_model, device):

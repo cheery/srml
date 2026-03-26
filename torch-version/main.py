@@ -655,6 +655,7 @@ def cmd_train(args):
                     memories=memories,
                     K=args.grpo_k,
                     sampling_steps=args.grpo_steps,
+                    epochs=args.grpo_epochs,
                     verbose=args.print_grpo,
                 )
                 avg_session = grpo_loss
@@ -711,26 +712,31 @@ def cmd_train(args):
             program_idx = (program_idx + 1) % len(programs)
 
     except KeyboardInterrupt:
-        print("\nInterrupted.")
+        print("\nInterrupted. Press Ctrl+C again to exit WITHOUT saving, or wait...")
+        try:
+            import time; time.sleep(2)
+        except KeyboardInterrupt:
+            print("Exiting WITHOUT saving.")
+            loss_fd.close()
+            return
 
-    finally:
-        loss_fd.close()
-        # Final save
-        elapsed = datetime.now() - start_time
-        training_log_lines.append(f"finished: {datetime.now().isoformat()}")
-        training_log_lines.append(f"elapsed: {elapsed}")
-        training_log_lines.append(f"total steps: {global_step}")
-        for p in programs:
-            training_log_lines.append(f"final: {p.description()}")
-        log = "\n".join(training_log_lines)
+    loss_fd.close()
+    # Final save
+    elapsed = datetime.now() - start_time
+    training_log_lines.append(f"finished: {datetime.now().isoformat()}")
+    training_log_lines.append(f"elapsed: {elapsed}")
+    training_log_lines.append(f"total steps: {global_step}")
+    for p in programs:
+        training_log_lines.append(f"final: {p.description()}")
+    log = "\n".join(training_log_lines)
 
-        wiki_state = None
-        for p in programs:
-            if isinstance(p, WikipediaProgram):
-                wiki_state = p.wiki_state()
+    wiki_state = None
+    for p in programs:
+        if isinstance(p, WikipediaProgram):
+            wiki_state = p.wiki_state()
 
-        save_checkpoint(ckpt_path, model, config, log, wiki_state)
-        print(f"Done. {global_step} steps in {elapsed}.")
+    save_checkpoint(ckpt_path, model, config, log, wiki_state)
+    print(f"Done. {global_step} steps in {elapsed}.")
 
 
 def cmd_eval(args):
@@ -991,6 +997,8 @@ def main():
                          help="Number of candidates per prompt for GRPO (default: 4)")
     p_train.add_argument("--grpo-steps", type=int, default=50, dest="grpo_steps",
                          help="Diffusion sampling steps for GRPO generation (default: 50)")
+    p_train.add_argument("--grpo-epochs", type=int, default=5, dest="grpo_epochs",
+                         help="Optimization epochs per GRPO batch (default: 5)")
     p_train.add_argument("--print-grpo", action="store_true", dest="print_grpo",
                          help="Print GRPO prompts, candidates, and rewards")
 
