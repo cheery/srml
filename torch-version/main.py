@@ -551,6 +551,7 @@ def cmd_train(args):
     global_step = 0
     running_loss = 0.0
     program_idx = 0
+    last_grpo_info = ""
 
     try:
         while True:
@@ -656,10 +657,9 @@ def cmd_train(args):
                     verbose=args.print_grpo,
                 )
                 avg_session = grpo_loss
-                if global_step % report_every == 0:
-                    print(f"    GRPO ({grpo_task}): reward={grpo_metrics['mean_reward']:.3f} "
-                          f"correct={grpo_metrics['frac_correct']:.1%} "
-                          f"max={grpo_metrics['max_reward']:.3f}")
+                last_grpo_info = (f" | GRPO({grpo_task}) r={grpo_metrics['mean_reward']:.2f}"
+                                  f" ok={grpo_metrics['frac_correct']:.0%}"
+                                  f" max={grpo_metrics['max_reward']:.2f}")
             else:
                 # Regular supervision steps
                 z = make_z(batch_size, seq_len, config.d_model, device=device)
@@ -686,7 +686,8 @@ def cmd_train(args):
                 else:
                     mem_info = ""
                 prog_name = program.description().split("(")[0]
-                print(f"  step {global_step:6d} | loss {avg:.4f} | {prog_name} | lr {scheduler.get_last_lr()[0]:.2e}{mem_info}")
+                print(f"  step {global_step:6d} | loss {avg:.4f} | {prog_name} | lr {scheduler.get_last_lr()[0]:.2e}{mem_info}{last_grpo_info}")
+                last_grpo_info = ""
                 running_loss = 0.0
 
             # Periodic memory refresh — re-encode with improved model
