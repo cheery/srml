@@ -492,6 +492,12 @@ def cmd_train(args):
         grpo_optimizer = optim.AdamW(lora_params, lr=args.lr, weight_decay=0.01)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+
+    # Separate GRPO optimizer to prevent Adam momentum corruption
+    # GRPO gradients have very different scale/statistics from SEDD gradients;
+    # sharing an optimizer causes progressive instability and eventual divergence
+    if args.grpo_every > 0 and grpo_optimizer is None:
+        grpo_optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     loss_fn   = loss_function(model, graph, noise)
 
     train_step = make_train_step(model, optimizer, loss_fn, device)
