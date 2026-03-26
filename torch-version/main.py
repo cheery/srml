@@ -25,6 +25,7 @@ import torch.optim as optim
 
 from model import SRLM, SRLMConfig, make_z, AbsorbingGraph, LogLinearNoise, Sampler, loss_function, MemoryBank
 from model.grpo import grpo_step, arithmetic_reward, sudoku_reward
+from model.lora import apply_lora, lora_parameters, merge_lora, unmerge_lora
 from wiki_data import WikiDataLoader
 
 # ---------------------------------------------------------------------------
@@ -479,6 +480,17 @@ def cmd_train(args):
     print(f"Parameters:       {param_count(model):,}")
     print(f"Parameter memory: {param_memory_mb(model):.1f} MB")
 
+    # LoRA for GRPO — apply adapters, create separate optimizer
+    lora_layers = []
+    grpo_optimizer = None
+    if args.lora_rank > 0 and args.grpo_every > 0:
+        lora_layers = apply_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)
+        lora_params = lora_parameters(model)
+        n_lora = sum(p.numel() for p in lora_params)
+        print(f"LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}, "
+              f"{len(lora_layers)} layers, {n_lora:,} trainable params")
+        grpo_optimizer = optim.AdamW(lora_params, lr=args.lr, weight_decay=0.01)
+
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     loss_fn   = loss_function(model, graph, noise)
 
@@ -649,8 +661,9 @@ def cmd_train(args):
                         batch = batch  # clean target
 
                 z = make_z(batch_size, seq_len, config.d_model, device=device)
+                grpo_opt = grpo_optimizer if grpo_optimizer is not None else optimizer
                 grpo_loss, z, grpo_metrics = grpo_step(
-                    model, optimizer, loss_fn, Sampler(), graph, noise,
+                    model, grpo_opt, loss_fn, Sampler(), graph, noise,
                     grpo_prompt, batch.to(device), reward_fn, z, device,
                     memories=memories,
                     K=args.grpo_k,
@@ -699,6 +712,8 @@ def cmd_train(args):
                 model.train()
 
             if global_step % save_every == 0:
+                if lora_layers:
+                    merge_lora(model)
                 wiki_state = None
                 for p in programs:
                     if isinstance(p, WikipediaProgram):
@@ -707,6 +722,8 @@ def cmd_train(args):
                 log = "\n".join(training_log_lines)
                 log += f"\nsaved at step {global_step}, elapsed {elapsed}"
                 save_checkpoint(ckpt_path, model, config, log, wiki_state)
+                if lora_layers:
+                    unmerge_lora(model)
 
             scheduler.step()
             program_idx = (program_idx + 1) % len(programs)
@@ -729,6 +746,9 @@ def cmd_train(args):
     for p in programs:
         training_log_lines.append(f"final: {p.description()}")
     log = "\n".join(training_log_lines)
+
+    if lora_layers:
+        merge_lora(model)
 
     wiki_state = None
     for p in programs:
@@ -997,8 +1017,12 @@ def main():
                          help="Number of candidates per prompt for GRPO (default: 4)")
     p_train.add_argument("--grpo-steps", type=int, default=50, dest="grpo_steps",
                          help="Diffusion sampling steps for GRPO generation (default: 50)")
-    p_train.add_argument("--grpo-epochs", type=int, default=5, dest="grpo_epochs",
-                         help="Optimization epochs per GRPO batch (default: 5)")
+    p_train.add_argument("--grpo-epochs", type=int, default=1, dest="grpo_epochs",
+                         help="Optimization epochs per GRPO batch (default: 1)")
+    p_train.add_argument("--lora-rank", type=int, default=0, dest="lora_rank",
+                         help="LoRA rank for GRPO (0 = disabled, trains all params)")
+    p_train.add_argument("--lora-alpha", type=float, default=16.0, dest="lora_alpha",
+                         help="LoRA scaling alpha (default: 16)")
     p_train.add_argument("--print-grpo", action="store_true", dest="print_grpo",
                          help="Print GRPO prompts, candidates, and rewards")
 

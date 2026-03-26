@@ -5,3 +5,4 @@ from .sampler import Sampler
 from .loss import loss_function
 from .memory import MemoryBank
 from .grpo import grpo_step, arithmetic_reward, sudoku_reward
+from .lora import apply_lora, lora_parameters, merge_lora, unmerge_lora, remove_lora
