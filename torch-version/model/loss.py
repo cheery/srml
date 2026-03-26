@@ -16,6 +16,7 @@ def loss_function(model, graph, noise):
     def sedd_hrm_loss(z, batch, t=None, perturbed_batch=None, memories=None):
         sampling_eps = 1e-3
         device = batch.device
+        MASK_TOKEN = graph.dim - 1
 
         if t is None:
             t = ((1 - sampling_eps)
@@ -26,6 +27,12 @@ def loss_function(model, graph, noise):
 
         if perturbed_batch is None:
             perturbed_batch = graph.sample_transition(batch, sigma[:, None])
+        else:
+            # Pre-masked batch (arithmetic, sudoku): apply diffusion noise
+            # consistent with sigma, but protect visible (non-mask) positions
+            visible = (perturbed_batch != MASK_TOKEN)
+            noised = graph.sample_transition(batch, sigma[:, None])
+            perturbed_batch = torch.where(visible, perturbed_batch, noised)
 
         z, log_score, aux_loss = model(z, perturbed_batch, sigma, memories=memories)
         loss = graph.score_entropy(log_score, sigma[:, None], perturbed_batch, batch)
