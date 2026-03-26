@@ -40,11 +40,12 @@ class Graph(abc.ABC):
     def reverse_rate(self, i: torch.Tensor, score: torch.Tensor) -> torch.Tensor:
         normalized_rate = self.transp_rate(i) * score
         # Zero diagonal, set to -row_sum
-        B_dims = tuple(range(i.ndim))
-        idx = (*[torch.arange(s, device=i.device) for s in i.shape], i)
-        normalized_rate[idx] = 0.0
-        row_sum = normalized_rate.sum(dim=-1)
-        normalized_rate[idx] = -row_sum
+        # Use gather/scatter for correct multi-dim indexing
+        diag_idx = i.unsqueeze(-1)  # (..., 1)
+        diag_vals = torch.gather(normalized_rate, -1, diag_idx)
+        normalized_rate.scatter_(-1, diag_idx, torch.zeros_like(diag_vals))
+        row_sum = normalized_rate.sum(dim=-1, keepdim=True)
+        normalized_rate.scatter_(-1, diag_idx, -row_sum)
         return normalized_rate
 
     def sample_rate(self, i: torch.Tensor, rate: torch.Tensor) -> torch.Tensor:

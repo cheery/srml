@@ -24,6 +24,7 @@ import torch.optim as optim
 #inductor_config.reorder_for_locality = False
 
 from model import SRLM, SRLMConfig, make_z, AbsorbingGraph, LogLinearNoise, Sampler, loss_function, MemoryBank
+from model.grpo import grpo_step, arithmetic_reward, sudoku_reward
 from wiki_data import WikiDataLoader
 
 # ---------------------------------------------------------------------------
@@ -616,14 +617,57 @@ def cmd_train(args):
                     query = model.input.input_emb(batch.clamp(0, config.vocab_size - 1))
                 memories = memory_bank.retrieve(query, args.memory_k)
 
-            # Run supervision steps
-            z = make_z(batch_size, seq_len, config.d_model, device=device)
-            session_loss = 0.0
-            for _ in range(supervision):
-                loss, z = train_step(z, batch, perturbed_batch, memories=memories)
-                session_loss += loss
+            # GRPO reinforcement step (for verifiable tasks)
+            use_grpo = args.grpo_every > 0
+            do_grpo = (use_grpo
+                       and global_step > 0
+                       and global_step % args.grpo_every == 0
+                       and isinstance(program, (ArithmeticProgram, SudokuProgram)))
 
-            avg_session = session_loss / supervision
+            if do_grpo:
+                # Pick reward function based on active program
+                if isinstance(program, ArithmeticProgram):
+                    reward_fn = arithmetic_reward
+                    grpo_task = "arithmetic"
+                else:
+                    reward_fn = lambda tok: sudoku_reward(tok, None)
+                    grpo_task = "sudoku"
+
+                # Build prompt: for arithmetic, generate fresh prompts
+                # For sudoku, use the perturbed batch (puzzle with masks)
+                if perturbed_batch is not None:
+                    grpo_prompt = perturbed_batch.to(device)
+                else:
+                    grpo_prompt = batch.to(device)
+                    # For arithmetic without explicit perturbed_batch,
+                    # re-fetch a batch to get proper prompts
+                    result = program.next_batch()
+                    if result is not None:
+                        batch, perturbed_batch = result
+                        grpo_prompt = perturbed_batch.to(device) if perturbed_batch is not None else batch.to(device)
+                        batch = batch  # clean target
+
+                z = make_z(batch_size, seq_len, config.d_model, device=device)
+                grpo_loss, z, grpo_metrics = grpo_step(
+                    model, optimizer, loss_fn, Sampler(), graph, noise,
+                    grpo_prompt, batch.to(device), reward_fn, z, device,
+                    K=args.grpo_k,
+                    sampling_steps=args.grpo_steps,
+                    verbose=args.print_grpo,
+                )
+                avg_session = grpo_loss
+                if global_step % report_every == 0:
+                    print(f"    GRPO ({grpo_task}): reward={grpo_metrics['mean_reward']:.3f} "
+                          f"correct={grpo_metrics['frac_correct']:.1%} "
+                          f"max={grpo_metrics['max_reward']:.3f}")
+            else:
+                # Regular supervision steps
+                z = make_z(batch_size, seq_len, config.d_model, device=device)
+                session_loss = 0.0
+                for _ in range(supervision):
+                    loss, z = train_step(z, batch, perturbed_batch, memories=memories)
+                    session_loss += loss
+                avg_session = session_loss / supervision
             running_loss += avg_session
             global_step += 1
 
@@ -890,6 +934,14 @@ def main():
                          help="Alternate memory on/off every N steps (0 = always on, default: 0)")
     p_train.add_argument("--interleave", type=int, default=0,
                          help="Switch between programs every N steps (0 = sequential, default: 0)")
+    p_train.add_argument("--grpo-every", type=int, default=0, dest="grpo_every",
+                         help="Run GRPO reinforcement every N steps (0 = disabled, default: 0)")
+    p_train.add_argument("--grpo-k", type=int, default=4, dest="grpo_k",
+                         help="Number of candidates per prompt for GRPO (default: 4)")
+    p_train.add_argument("--grpo-steps", type=int, default=50, dest="grpo_steps",
+                         help="Diffusion sampling steps for GRPO generation (default: 50)")
+    p_train.add_argument("--print-grpo", action="store_true", dest="print_grpo",
+                         help="Print GRPO prompts, candidates, and rewards")
 
     # --- eval ---
     p_eval = sub.add_parser("eval", help="Interactive evaluation")
