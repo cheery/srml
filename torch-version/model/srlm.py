@@ -36,25 +36,6 @@ class BlockAttnRes(nn.Module):
         return h
 
 
-def chunk_mean_pool(x: torch.Tensor, chunk_size: int) -> torch.Tensor:
-    """(B, L, D) -> (B, ceil(L/P), D) via mean pooling over chunks of size P."""
-    B, L, D = x.shape
-    pad_len = (-L) % chunk_size
-    if pad_len > 0:
-        x = F.pad(x, (0, 0, 0, pad_len))
-        # mask out padding so it doesn't pollute the mean
-        mask = torch.cat([
-            torch.ones(L, device=x.device),
-            torch.zeros(pad_len, device=x.device),
-        ])
-    else:
-        mask = torch.ones(L, device=x.device)
-    n_chunks = x.shape[1] // chunk_size
-    x = x.reshape(B, n_chunks, chunk_size, D)
-    w = mask.reshape(1, n_chunks, chunk_size, 1)
-    return (x * w).sum(dim=2) / w.sum(dim=2).clamp(min=1e-8)
-
-
 class RouterProjection(nn.Module):
     """Learned router that re-weights block contributions per posterior layer.
 
@@ -108,6 +89,7 @@ class SRLM(nn.Module):
         ])
         self.norm      = AdaLN(cfg.d_model)
         self.output    = OutputLayer(cfg)
+        self.Q_head    = nn.Linear(cfg.d_model, 1)
 
     @torch.no_grad()
     def encode_document(self, tokens: torch.Tensor) -> torch.Tensor:
@@ -158,22 +140,39 @@ class SRLM(nn.Module):
             encoded.append(self.block_res(blocks))
         return torch.stack(encoded).mean(dim=0)  # (B, L, D)
 
-    def forward(self, z, x, sigma, memories=None):
+    def front(self, x, sigma, memories=None):
+        """Encode input through prior layers with optional memory context.
+
+        Memories are injected into the block list so prior layers and HRM
+        both have access to stored context.
+        """
         q, p, t = self.input(x, sigma)
         blocks = [q]
-
+        if memories is not None:
+            blocks.extend(memories)
         for layer in self.prior:
             h = self.block_res(blocks)
             y = layer(h, p, t)
             blocks.append(y)
-
         h = self.block_res(blocks)
-        z, y = self.main(z, h, p, t)
-        blocks.append(y)
+        return x, h, blocks, p, t, sigma
 
-        # Append external memories — router scores them alongside pipeline blocks
-        if memories is not None:
-            blocks.extend(memories)
+    def step(self, st, ix):
+        """Run HRM + posterior layers. ix comes from front().
+
+        Returns:
+            st: new HRM state (detached)
+            log_score: (B, L, V) output logits
+            q: (B, 1) halting signal
+            aux_loss: routing entropy loss
+        """
+        x, h, blocks, p, t, sigma = ix
+        # Copy blocks so repeated step() calls don't accumulate
+        blocks = list(blocks)
+
+        st, y = self.main(st, h, p, t)
+        q = self.Q_head(y.mean(dim=1))  # (B, 1) — adaptive halting signal
+        blocks.append(y)
 
         aux_routing_losses = []
         for layer, router in zip(self.posterior, self.routers):
@@ -195,88 +194,59 @@ class SRLM(nn.Module):
                 aux_loss = aux_loss + (max_entropy - entropy)
             aux_loss = aux_loss / len(aux_routing_losses) * self.cfg.aux_routing_weight
 
-        return z, self.output(x, y, sigma), aux_loss
+        return st, self.output(x, y, sigma), q, aux_loss
+
+    def forward(self, z, x, sigma, memories=None):
+        """Standard API: front() + step() in one call.
+
+        Args:
+            z: HRM state tuple (y, z)
+            x: (B, L) input token IDs
+            sigma: (B,) noise level
+            memories: optional list of memory tensors
+        Returns:
+            z: new HRM state
+            log_score: (B, L, V) output logits
+            aux_loss: scalar auxiliary loss
+        """
+        ix = self.front(x, sigma, memories=memories)
+        st, log_score, q, aux_loss = self.step(z, ix)
+        return st, log_score, aux_loss
 
 class HRM(nn.Module):
+    """Hierarchical Recurrent Memory — v2 (TRM-inspired).
+
+    Uses a single shared DiTBlock for both fast and slow recursion roles,
+    following TRM's finding that one network generalizes better than two.
+
+    Fast step:  zL = block(zL + zH + x, p, t)   — refine with input
+    Slow step:  zH = block(zH + zL, p, t)        — consolidate
+
+    All iterations except the final cycle run under no_grad.
+    """
     def __init__(self, cfg: SRLMConfig):
         super().__init__()
-        self.N    = cfg.N
-        self.T    = cfg.T
-        self.fast = FastLayer(cfg)
-        self.slow = SlowLayer(cfg)
+        self.N = cfg.N
+        self.T = cfg.T
+        self.block = DiTBlock(cfg.d_model, cfg.d_model, num_heads=cfg.n_heads,
+                              mlp_ratio=4.0, dropout=cfg.dropout)
+        self.norm_y = AdaLN(cfg.d_model)
+        self.norm_z = AdaLN(cfg.d_model)
 
-    def forward(self, z, x, p, t):
-        zH, zL = z
+    def latent_recursion(self, x, y, z, p, t, n):
+        for i in range(n):
+            z = self.block(x + y + z, p, t)
+        y = self.block(y + z, p, t)
+        return y, z
+
+    def forward(self, st, x, p, t):
+        y, z = self.norm_y(st[0], t), self.norm_z(st[1], t)
 
         with torch.no_grad():
-            for i in range(self.N * self.T - 1):
-                zL = self.fast(zH, zL, x, p, t)
-                if (i + 1) % self.T == 0:
-                    zH = self.slow(zH, zL, p, t)
-
-        zL = self.fast(zH, zL, x, p, t)
-        zH = self.slow(zH, zL, p, t)
-        return (zH, zL), zH
-
-class FastLayer(nn.Module):
-    def __init__(self, cfg: SRLMConfig):
-        super().__init__()
-        self.chunk_size = cfg.chunk_size
-        self.normH = AdaLN(cfg.d_model)
-        self.normL = AdaLN(cfg.d_model)
-        self.normX = AdaLN(cfg.d_model)
-        # Cross-attention: zL queries pooled zH
-        self.cross_q = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-        self.cross_k = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-        self.cross_v = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-        self.cross_out = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-        self.n_heads = cfg.n_heads
-        self.inj   = nn.Linear(cfg.d_model * 3, cfg.d_model)
-        self.drop  = nn.Dropout(cfg.dropout)
-        self.s5d   = DiTBlock(cfg.d_model, cfg.d_model, num_heads=cfg.n_heads, mlp_ratio=4.0, dropout=cfg.dropout)
-
-    def forward(self, zH: torch.Tensor, zL: torch.Tensor, x: torch.Tensor, p: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        zH_norm = self.normH(zH, t)
-        zL_norm = self.normL(zL, t)
-        x_norm  = self.normX(x, t)
-
-        # Chunk-mean-pool the slow state for compressed cross-attention
-        zH_pooled = chunk_mean_pool(zH_norm, self.chunk_size)  # (B, L//P, D)
-
-        # Cross-attention: zL queries into pooled zH
-        B, L, D = zL_norm.shape
-        hd = D // self.n_heads
-        q = self.cross_q(zL_norm).view(B, L, self.n_heads, hd).transpose(1, 2)
-        Lp = zH_pooled.shape[1]
-        k = self.cross_k(zH_pooled).view(B, Lp, self.n_heads, hd).transpose(1, 2)
-        v = self.cross_v(zH_pooled).view(B, Lp, self.n_heads, hd).transpose(1, 2)
-        zH_ctx = F.scaled_dot_product_attention(q, k, v)       # (B, H, L, hd)
-        zH_ctx = zH_ctx.transpose(1, 2).contiguous().view(B, L, D)
-        zH_ctx = self.cross_out(zH_ctx)
-
-        x = torch.cat([zH_ctx, zL_norm, x_norm], dim=-1)  # (B, L, 3*D)
-        x = self.drop(self.inj(x))                         # (B, L, D)
-        x = self.s5d(x, p, t)
-        return x
-
-
-class SlowLayer(nn.Module):
-    def __init__(self, cfg: SRLMConfig):
-        super().__init__()
-        self.normH = AdaLN(cfg.d_model)
-        self.normL = AdaLN(cfg.d_model)
-        self.inj   = nn.Linear(cfg.d_model * 2, cfg.d_model)
-        self.drop  = nn.Dropout(cfg.dropout)
-        self.s5d   = DiTBlock(cfg.d_model, cfg.d_model, num_heads=cfg.n_heads, mlp_ratio=4.0, dropout=cfg.dropout)
-
-    def forward(self, zH: torch.Tensor, zL: torch.Tensor, p: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        zH = self.normH(zH, t)
-        zL = self.normL(zL, t)
-        x = torch.cat([zH, zL], dim=-1)  # (B, L, 2*D)
-        x = self.drop(self.inj(x))
-        x = self.s5d(x, p, t)
-        return x
-
+            for j in range(self.T - 1):
+                y, z = self.latent_recursion(x, y, z, p, t, self.N)
+        y, z = self.latent_recursion(x, y, z, p, t, self.N)
+        return (y.detach(), z.detach()), y
 
 def _sinusoidal_pos_emb(length: int, dim: int) -> torch.Tensor:
     half = dim // 2

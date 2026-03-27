@@ -70,7 +70,7 @@ def apply_lora(model, rank=8, alpha=16.0, dropout=0.0, targets=None):
         list of LoRALinear modules that were inserted
     """
     if targets is None:
-        targets = ['qkv', 'out_proj', 'cross_q', 'cross_k', 'cross_v', 'cross_out']
+        targets = ['qkv', 'out_proj']
 
     lora_layers = []
 

@@ -7,13 +7,13 @@ class EulerPredictor:
         self.graph = graph
         self.noise = noise
 
-    def update_fn(self, score_fn, arg, x, t, step_size):
+    def update_fn(self, score_fn, x, t, step_size):
         sigma, dsigma = self.noise(t)
-        arg, log_score = score_fn(arg, x, sigma)
+        log_score = score_fn(x, sigma)
         score = log_score.exp()
         rev_rate = step_size * dsigma[..., None, None] * self.graph.reverse_rate(x, score)
         x = self.graph.sample_rate(x, rev_rate)
-        return arg, x
+        return x
 
 
 class Denoiser:
@@ -21,9 +21,9 @@ class Denoiser:
         self.graph = graph
         self.noise = noise
 
-    def update_fn(self, score_fn, arg, x, t):
+    def update_fn(self, score_fn, x, t):
         sigma = self.noise(t)[0]
-        arg, log_score = score_fn(arg, x, sigma)
+        log_score = score_fn(x, sigma)
         score = log_score.exp()
 
         stag_score = self.graph.staggered_score(score, sigma)
@@ -31,14 +31,13 @@ class Denoiser:
         if self.graph.absorb:
             probs = probs[..., :-1]
 
-        return arg, sample_categorical(probs)
+        return sample_categorical(probs)
 
 
 class Sampler:
     def sample(
         self,
         score_fn,
-        arg,
         graph,
         noise,
         tokenizer,
@@ -54,8 +53,7 @@ class Sampler:
         """Run the full reverse diffusion sampling loop.
 
         Args:
-            score_fn:   callable(arg, x, sigma) -> (arg, log_score)
-            arg:        initial model state (e.g. z tuple)
+            score_fn:   callable(x, sigma) -> log_score
             graph:      Graph instance
             noise:      Noise instance
             tokenizer:  callable(x: int tensor) -> str
@@ -67,7 +65,7 @@ class Sampler:
             projector:  optional fn to constrain x between steps
             device:     torch device
         Returns:
-            (arg, list[str])
+            list[str]
         """
         predictor = EulerPredictor(graph, noise)
         denoiser  = Denoiser(graph, noise)
@@ -81,7 +79,7 @@ class Sampler:
             for i in range(steps):
                 t = timesteps[i].expand(batch_size)
                 x = projector(x)
-                arg, x = predictor.update_fn(score_fn, arg, x, t, dt)
+                x = predictor.update_fn(score_fn, x, t, dt)
 
                 if show_intermediate:
                     print(f"{i} @ {timesteps[i].item():.5f}:")
@@ -93,10 +91,10 @@ class Sampler:
         if denoise:
             x = projector(x)
             t = timesteps[-1].expand(batch_size)
-            arg, x = denoiser.update_fn(score_fn, arg, x, t)
+            x = denoiser.update_fn(score_fn, x, t)
 
         if show_intermediate:
             print("Denoised:")
             print(repr([tokenizer(xi) for xi in x]))
 
-        return arg, [tokenizer(xi) for xi in x]
+        return [tokenizer(xi) for xi in x]

@@ -142,6 +142,7 @@ def grpo_step(
     epochs=5,
     beta_dgpo=1.0,       # DGPO sigmoid temperature
     fused=False,          # fused backward: faster but more VRAM
+    max_act_steps=8,     # adaptive computation steps per diffusion step
 ):
     """DGPO-style GRPO update for discrete diffusion.
 
@@ -182,12 +183,17 @@ def grpo_step(
     dt = (1 - eps) / sampling_steps
 
     with torch.no_grad():
-        z_gen = make_z_for_grpo(B * K, L, d_model, device)
         for i in range(sampling_steps):
             t = timesteps[i].expand(B * K)
             x = projector(x)
             sigma, dsigma = noise(t)
-            z_gen, log_score, _ = model(z_gen, x, sigma, memories=memories_expanded)
+            # Fresh z + adaptive computation via Q_head
+            z_gen = make_z_for_grpo(B * K, L, d_model, device)
+            ix = model.front(x, sigma, memories=memories_expanded)
+            for _ in range(max_act_steps):
+                z_gen, log_score, q, _ = model.step(z_gen, ix)
+                if (q.squeeze(-1) > 0).all():
+                    break
             score = log_score.exp()
             rev_rate = dt * dsigma[..., None, None] * graph.reverse_rate(x, score)
             x = graph.sample_rate(x, rev_rate)
@@ -196,7 +202,12 @@ def grpo_step(
         x = projector(x)
         t = timesteps[-1].expand(B * K)
         sigma = noise(t)[0]
-        z_gen, log_score, _ = model(z_gen, x, sigma)
+        z_gen = make_z_for_grpo(B * K, L, d_model, device)
+        ix = model.front(x, sigma)
+        for _ in range(max_act_steps):
+            z_gen, log_score, q, _ = model.step(z_gen, ix, memories=memories_expanded)
+            if (q.squeeze(-1) > 0).all():
+                break
         score = log_score.exp()
         stag_score = graph.staggered_score(score, sigma)
         probs = stag_score * graph.transp_transition(x.long(), sigma)
@@ -265,7 +276,7 @@ def grpo_step(
                 })
             ref_cache.append(ep_data)
 
-    # --- 5. DGPO optimization ---
+    # --- 5. DGPO optimization with Q_head ---
     model.train()
     total_loss = 0.0
 
@@ -276,15 +287,23 @@ def grpo_step(
         if fused:
             # Fused mode: single backward over all K (faster, more VRAM)
             losses_k = []
+            q_loss_total = torch.tensor(0.0, device=device)
             aux_total = torch.tensor(0.0, device=device)
             for k in range(K):
                 c = ref_cache[ep][k]
                 z_k = tuple(zi[:B].detach() for zi in z) if z[0].shape[0] >= B else z
-                z_k, log_score, aux_loss = model(z_k, c['perturbed'], c['sigma'], memories=memories)
+                ix = model.front(c['perturbed'], c['sigma'], memories=memories)
+                z_k, log_score, q, aux_loss = model.step(z_k, ix)
                 loss_pp = graph.score_entropy(log_score, c['sigma'][:, None], c['perturbed'], c['candidate'])
                 loss_ps = (c['dsigma'][:, None] * loss_pp).sum(dim=-1)
                 losses_k.append(loss_ps)
                 aux_total = aux_total + aux_loss
+
+                # Q_head BCE: predict whether candidate is good (reward > 0.5)
+                idx = torch.arange(B, device=device) * K + k
+                q_target = (rewards[idx] > 0.5).float()
+                q_loss_total = q_loss_total + F.binary_cross_entropy_with_logits(
+                    q.squeeze(-1), q_target)
 
             group_terms = torch.zeros(B, device=device)
             for k in range(K):
@@ -300,7 +319,7 @@ def grpo_step(
                 n_masked = (~visible).sum().item()
                 n_tokens += max(n_masked, 1)
 
-            (weighted_sum + aux_total).backward()
+            (weighted_sum + q_loss_total + aux_total).backward()
             total_loss += weighted_sum.item()
 
         else:
@@ -328,15 +347,20 @@ def grpo_step(
                 adv_k = advantages[idx]
 
                 z_k = tuple(zi[:B].detach() for zi in z) if z[0].shape[0] >= B else z
-                z_k, log_score, aux_loss = model(z_k, c['perturbed'], c['sigma'], memories=memories)
+                ix = model.front(c['perturbed'], c['sigma'], memories=memories)
+                z_k, log_score, q, aux_loss = model.step(z_k, ix)
                 loss_pp = graph.score_entropy(log_score, c['sigma'][:, None], c['perturbed'], c['candidate'])
                 loss_ps = (c['dsigma'][:, None] * loss_pp).sum(dim=-1)
+
+                # Q_head BCE: predict whether candidate is good (reward > 0.5)
+                q_target = (rewards[idx] > 0.5).float()
+                q_loss = F.binary_cross_entropy_with_logits(q.squeeze(-1), q_target)
 
                 weighted_loss = (group_weights.detach() * adv_k * loss_ps).sum()
                 n_masked = (~visible).sum().item()
                 n_tokens += max(n_masked, 1)
 
-                (weighted_loss + aux_loss).backward()
+                (weighted_loss + q_loss + aux_loss).backward()
                 total_loss += weighted_loss.item()
 
         if n_tokens > 0:

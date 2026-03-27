@@ -23,7 +23,7 @@ import torch.optim as optim
 #import torch._inductor.config as inductor_config
 #inductor_config.reorder_for_locality = False
 
-from model import SRLM, SRLMConfig, make_z, AbsorbingGraph, LogLinearNoise, Sampler, loss_function, MemoryBank
+from model import SRLM, SRLMConfig, make_z, AbsorbingGraph, LogLinearNoise, Sampler, loss_function, deep_supervision_step, MemoryBank, EMA
 from model.grpo import grpo_step, arithmetic_reward, sudoku_reward
 from model.lora import apply_lora, lora_parameters, merge_lora, unmerge_lora
 from wiki_data import WikiDataLoader
@@ -97,10 +97,13 @@ def sample_batch_random(raw: torch.Tensor, seq_len: int, batch: int) -> torch.Te
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(ckpt_dir: Path, model: nn.Module, config: SRLMConfig,
-                    training_log: str, wiki_state: dict | None = None):
+                    training_log: str, wiki_state: dict | None = None,
+                    ema=None):
     """Save checkpoint directory with all spec files."""
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), ckpt_dir / "parameters.pt")
+    if ema is not None:
+        torch.save(ema.state_dict(), ckpt_dir / "ema.pt")
     with open(ckpt_dir / "config.json", "w") as f:
         json.dump(asdict(config), f, indent=2)
     with open(ckpt_dir / "training.txt", "w") as f:
@@ -399,14 +402,21 @@ class QAProgram:
 # Score function wrapper for sampler
 # ---------------------------------------------------------------------------
 
-def make_score_fn(model, device, memories=None):
+def make_score_fn(model, device, d_model, memories=None, max_act_steps=8):
     @torch.no_grad()
-    def score_fn(z, x, sigma):
+    def score_fn(x, sigma):
         x = x.to(device)
         sigma = sigma.to(device)
-        z = tuple(zi.to(device) for zi in z)
-        z, log_score, _aux = model(z, x, sigma, memories=memories)
-        return z, log_score
+        B, L = x.shape
+        z = make_z(B, L, d_model, device=device)
+
+        # Adaptive computation: recurse until Q_head says "good enough"
+        ix = model.front(x, sigma, memories=memories)
+        for _ in range(max_act_steps):
+            z, log_score, q, _aux = model.step(z, ix)
+            if (q.squeeze(-1) > 0).all():
+                break
+        return log_score
     return score_fn
 
 # ---------------------------------------------------------------------------
@@ -498,6 +508,14 @@ def cmd_train(args):
     # sharing an optimizer causes progressive instability and eventual divergence
     if args.grpo_every > 0 and grpo_optimizer is None:
         grpo_optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+
+    # EMA for training stability (TRM uses mu=0.999)
+    ema = EMA(model, mu=0.999)
+    ema_path = ckpt_path / "ema.pt"
+    if ema_path.exists():
+        ema.load_state_dict(torch.load(ema_path, map_location=device, weights_only=True))
+        print(f"Loaded EMA from {ema_path}")
+
     loss_fn   = loss_function(model, graph, noise)
 
     train_step = make_train_step(model, optimizer, loss_fn, device)
@@ -683,19 +701,24 @@ def cmd_train(args):
                     verbose=args.print_grpo,
                     beta_dgpo=args.grpo_beta,
                     fused=args.grpo_fused,
+                    max_act_steps=args.grpo_act_steps,
                 )
                 avg_session = grpo_loss
                 last_grpo_info = (f" | GRPO({grpo_task}) r={grpo_metrics['mean_reward']:.2f}"
                                   f" ok={grpo_metrics['frac_correct']:.0%}"
                                   f" max={grpo_metrics['max_reward']:.2f}")
             else:
-                # Regular supervision steps
+                # TRM-style deep supervision: front() once, step() N times
                 z = make_z(batch_size, seq_len, config.d_model, device=device)
-                session_loss = 0.0
-                for _ in range(supervision):
-                    loss, z = train_step(z, batch, perturbed_batch, memories=memories)
-                    session_loss += loss
-                avg_session = session_loss / supervision
+                batch_dev = batch.to(device)
+                pb_dev = perturbed_batch.to(device) if perturbed_batch is not None else None
+                avg_session, z = deep_supervision_step(
+                    model, optimizer, graph, noise, z, batch_dev,
+                    n_supervision=supervision,
+                    perturbed_batch=pb_dev,
+                    memories=memories,
+                    ema=ema,
+                )
             running_loss += avg_session
             global_step += 1
 
@@ -734,7 +757,7 @@ def cmd_train(args):
                 elapsed = datetime.now() - start_time
                 log = "\n".join(training_log_lines)
                 log += f"\nsaved at step {global_step}, elapsed {elapsed}"
-                save_checkpoint(ckpt_path, model, config, log, wiki_state)
+                save_checkpoint(ckpt_path, model, config, log, wiki_state, ema=ema)
                 if lora_layers:
                     unmerge_lora(model)
 
@@ -768,7 +791,7 @@ def cmd_train(args):
         if isinstance(p, WikipediaProgram):
             wiki_state = p.wiki_state()
 
-    save_checkpoint(ckpt_path, model, config, log, wiki_state)
+    save_checkpoint(ckpt_path, model, config, log, wiki_state, ema=ema)
     print(f"Done. {global_step} steps in {elapsed}.")
 
 
@@ -795,6 +818,18 @@ def cmd_eval(args):
     if not load_checkpoint(model, ckpt_path):
         print(f"No checkpoint found at {ckpt_path}")
         sys.exit(1)
+
+    # Load EMA weights for eval if requested
+    if getattr(args, 'ema', False):
+        ema_path = ckpt_path / "ema.pt"
+        if ema_path.exists():
+            ema = EMA(model, mu=0.999)
+            ema.load_state_dict(torch.load(ema_path, map_location=device, weights_only=True))
+            ema.apply(model)
+            print("Using EMA weights for eval")
+        else:
+            print("Warning: --ema requested but no ema.pt found")
+
     no_compile = getattr(args, 'no_compile', False)
     if not no_compile:
         for layer in model.prior:
@@ -814,10 +849,8 @@ def cmd_eval(args):
         memory_bank = MemoryBank()
         print(f"Memory bank enabled: size={args.memory_size}, k={args.memory_k}")
 
-    score_fn = make_score_fn(model, device, memories=memories)
-
-    # Persistent z state across queries
-    z = make_z(1, seq_len, config.d_model, device=device)
+    act_steps = getattr(args, 'act_steps', 8)
+    score_fn = make_score_fn(model, device, config.d_model, memories=memories, max_act_steps=act_steps)
 
     while True:
         query_text = input("> ")
@@ -825,8 +858,7 @@ def cmd_eval(args):
 
         # Commands
         if query_text.strip() == "!reset":
-            z = make_z(1, seq_len, config.d_model, device=device)
-            print("z reset.")
+            print("Reset (z is now per-call, nothing to reset).")
             continue
 
         if query_text.strip() == "!remember" and memory_bank is not None:
@@ -863,9 +895,9 @@ def cmd_eval(args):
                 with torch.no_grad():
                     q_emb = model.input.input_emb(query.unsqueeze(0).clamp(0, config.vocab_size - 1).to(device))
                 memories = memory_bank.retrieve(q_emb, args.memory_k)
-            score_fn = make_score_fn(model, device, memories=memories)
+            score_fn = make_score_fn(model, device, config.d_model, memories=memories, max_act_steps=act_steps)
         else:
-            score_fn = make_score_fn(model, device)
+            score_fn = make_score_fn(model, device, config.d_model, max_act_steps=act_steps)
 
         if query_text.strip() == "!sudoku":
             if puzzles is None:
@@ -906,8 +938,8 @@ def cmd_eval(args):
                 x[:, :L] = torch.where(cm[:L], cv[:L], x[:, :L])
                 return x
 
-            z, outputs = sampler.sample(
-                score_fn, z, graph, noise,
+            outputs = sampler.sample(
+                score_fn, graph, noise,
                 tokenizer=as_text,
                 batch_size=1,
                 batch_len=seq_len,
@@ -943,8 +975,8 @@ def cmd_eval(args):
                 q = q.to(x.device)
                 x[:, :len(q)] = q
                 return x
-            z, outputs = sampler.sample(
-                score_fn, z, graph, noise,
+            outputs = sampler.sample(
+                score_fn, graph, noise,
                 tokenizer=as_text,
                 batch_size=1,
                 batch_len=seq_len,
@@ -1006,8 +1038,8 @@ def main():
                          help="Save checkpoint every N global steps (default: 1000)")
     p_train.add_argument("--report-every", type=int, default=10,
                          help="Report loss every N steps (default: 10)")
-    p_train.add_argument("--supervision", type=int, default=5,
-                         help="Supervision steps per training step (default: 5)")
+    p_train.add_argument("--supervision", type=int, default=20,
+                         help="Supervision steps per training step (default: 20)")
     p_train.add_argument("--batch-size", type=int, default=32,
                          help="Batch size (default: 32)")
     p_train.add_argument("--seq-len", type=int, default=None,
@@ -1040,6 +1072,8 @@ def main():
                          help="LoRA scaling alpha (default: 16)")
     p_train.add_argument("--grpo-beta", type=float, default=1.0, dest="grpo_beta",
                          help="DGPO sigmoid temperature (default: 1.0)")
+    p_train.add_argument("--grpo-act-steps", type=int, default=20, dest="grpo_act_steps",
+                         help="Adaptive computation steps per diffusion step in GRPO (default: 20)")
     p_train.add_argument("--grpo-fused", action="store_true", dest="grpo_fused",
                          help="Fused GRPO backward (faster, uses more VRAM)")
     p_train.add_argument("--print-grpo", action="store_true", dest="print_grpo",
@@ -1058,6 +1092,10 @@ def main():
                         help="Memory bank capacity (0 = disabled)")
     p_eval.add_argument("--memory-k", type=int, default=2,
                         help="Number of memories to retrieve per query")
+    p_eval.add_argument("--ema", action="store_true",
+                        help="Use EMA weights for eval (only useful after long training)")
+    p_eval.add_argument("--act-steps", type=int, default=20,
+                        help="Max adaptive computation steps per diffusion step (default: 20)")
 
     args = parser.parse_args()
     if args.tf32:
