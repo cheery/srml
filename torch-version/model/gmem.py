@@ -308,7 +308,6 @@ class GMemLLM(nn.Module):
         self.memory_bank = LatentMemoryBank(
             hidden_dim=hidden_dim,
             memory_dim=memory_dim,
-            num_slots=num_slots,
             num_heads=num_heads,
         )
 

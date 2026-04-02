@@ -29,6 +29,7 @@ from model.model import (
     SRLMDenoiser, SRLMEnergyModel, SRLMPonder,
     mdlm_loss, nce_loss, sample, PonderTrainer,
 )
+from model.gmem import MemoryLoss
 from model.edlm import LogLinearSchedule, Sampler
 from model.ema import EMA
 from model.grpo import grpo_step, arithmetic_reward, sudoku_reward
@@ -499,6 +500,7 @@ def cmd_train(args):
     all_params = list(denoiser.parameters()) + list(ponder_model.parameters())
     optimizer = optim.AdamW(all_params, lr=args.lr, weight_decay=0.01)
     ema = EMA(denoiser, mu=0.999)
+    mem_loss_fn = MemoryLoss()
 
     ema_path = ckpt_path / "ema.pt"
     if ema_path.exists():
@@ -584,7 +586,7 @@ def cmd_train(args):
     running_loss = 0.0
     program_idx = 0
     ema_loss = None
-    memory = None  # G-Mem state, threads across steps
+    memory = denoiser.init_memory(batch_size, device)
 
     try:
         while True:
@@ -685,6 +687,7 @@ def cmd_train(args):
                     denoiser, x0, schedule, memory,
                     answer_mask=answer_mask,
                 )
+                loss += mem_loss_fn(importance_scores)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
                 optimizer.step()
@@ -716,6 +719,7 @@ def cmd_train(args):
                     denoiser, replay_x0, schedule, replay_mem,
                     answer_mask=replay_mask,
                 )
+                loss += mem_loss_fn(importance_scores)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
                 optimizer.step()
@@ -908,10 +912,10 @@ def cmd_eval(args):
             ponder_input[0, :p_len] = puz_tokens[:p_len].to(device)
 
             with torch.no_grad():
-                h_p, _, _, _ = ponder_model.get_front(ponder_input, memory)
+                h_p, p_emb, _ = ponder_model.get_front(ponder_input, memory)
                 z_H, z_L = ponder_model.init_states(h_p)
                 for _ in range(n_ponder):
-                    z_H, z_L, _ = ponder_model.ponder(h_p, z_H, z_L)
+                    z_H, z_L, _ = ponder_model.ponder(h_p, p_emb, z_H, z_L)
                 memory = ponder_model(z_H, memory)
 
             # Denoiser generates with clue clamping
@@ -962,10 +966,10 @@ def cmd_eval(args):
             ponder_input[0, :q_len] = query[:q_len].to(device)
 
             with torch.no_grad():
-                h_p, _, _, _ = ponder_model.get_front(ponder_input, memory)
+                h_p, p_emb, _ = ponder_model.get_front(ponder_input, memory)
                 z_H, z_L = ponder_model.init_states(h_p)
                 for _ in range(n_ponder):
-                    z_H, z_L, _ = ponder_model.ponder(h_p, z_H, z_L)
+                    z_H, z_L, _ = ponder_model.ponder(h_p, p_emb, z_H, z_L)
                 memory = ponder_model(z_H, memory)
 
             # Step 2: Denoiser generates from all-masked using enriched memory

@@ -8,7 +8,6 @@ A TRM-style recursive reasoning architecture with:
   - Shared recursive transformer block (L-module = H-module)
   - Contraction mapping via equilibrium + Routh-Hurwitz stability losses
   - Hyperspherical repulsion loss to prevent representational collapse
-  - StableMax3/5 polynomial softmax approximations
   - Neural SDE noise injection for robust latent trajectories
   - Adaptive loss balancing via AlgGradNorm
   - Deep supervision with ACT (adaptive computational time)
@@ -32,124 +31,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import Optional
-
-
-# ============================================================
-# StableMax variants (Section 3.2.3, Eqs 35-40)
-# ============================================================
-
-def _stablemax_s(x: torch.Tensor) -> torch.Tensor:
-    """Original StableMax base function s(x), Eq 36."""
-    pos = 1.0 + x
-    neg = 1.0 / (1.0 - x)
-    return torch.where(x >= 0, pos, neg)
-
-
-def _stablemax3_s(x: torch.Tensor) -> torch.Tensor:
-    """StableMax3 base function s_3(x), Eq 38.
-    3rd-order Taylor approx of exp(x)."""
-    pos = 1.0 + x * (1.0 + 0.5 * x * (1.0 + x / 3.0))
-    neg = 1.0 / (1.0 - x * (1.0 - 0.5 * x * (1.0 - x / 3.0)))
-    return torch.where(x >= 0, pos, neg)
-
-
-def _stablemax5_s(x: torch.Tensor) -> torch.Tensor:
-    """StableMax5 base function s_5(x), Eq 40.
-    5th-order Taylor approx of exp(x)."""
-    pos = 1.0 + x * (1.0 + 0.5 * x * (1.0 + x * (1.0 + x / 5.0) / 4.0 / 3.0))
-    neg_inner = 1.0 - x * (1.0 - 0.5 * x * (1.0 - x * (1.0 - x / 5.0) / 4.0 / 3.0))
-    return torch.where(x >= 0, pos, 1.0 / neg_inner)
-
-
-def stablemax(logits: torch.Tensor, variant: str = "3", dim: int = -1) -> torch.Tensor:
-    """StableMax normalization (replaces softmax). Eqs 35, 37, 39."""
-    # Subtract max for numerical stability (same trick as softmax)
-    logits = logits - logits.max(dim=dim, keepdim=True).values
-    if variant == "1":
-        s = _stablemax_s(logits)
-    elif variant == "3":
-        s = _stablemax3_s(logits)
-    elif variant == "5":
-        s = _stablemax5_s(logits)
-    else:
-        raise ValueError(f"Unknown StableMax variant: {variant}")
-    return s / s.sum(dim=dim, keepdim=True)
-
-
-def stablemax_cross_entropy(logits: torch.Tensor, targets: torch.Tensor,
-                            variant: str = "3") -> torch.Tensor:
-    """Cross-entropy using StableMax instead of softmax."""
-    probs = stablemax(logits, variant=variant)
-    # Clamp for log stability
-    log_probs = torch.log(probs.clamp(min=1e-10))
-    return F.nll_loss(log_probs.view(-1, logits.size(-1)),
-                      targets.view(-1), reduction="mean")
-
-
-# ============================================================
-# RMS Normalization
-# ============================================================
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-
-    def forward(self, x):
-        rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return x / rms * self.weight
-
-
-# ============================================================
-# MLP-Mixer layer (token-mixing alternative to attention)
-# ============================================================
-
-class MLPMixer(nn.Module):
-    """MLP-mixer: token-mixing MLP applied across the sequence dimension."""
-    def __init__(self, seq_len: int, dim: int, expansion: int = 4):
-        super().__init__()
-        self.token_mix = nn.Sequential(
-            nn.Linear(seq_len, seq_len * expansion),
-            nn.Tanh(),
-            nn.Linear(seq_len * expansion, seq_len),
-        )
-
-    def forward(self, x):
-        # x: (B, S, D) → transpose → mix tokens → transpose back
-        return self.token_mix(x.transpose(-1, -2)).transpose(-1, -2)
-
-
-# ============================================================
-# Self-Attention with optional StableMax
-# ============================================================
-
-class SelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 4,
-                 use_stablemax: str = "none"):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
-        self.out_proj = nn.Linear(dim, dim)
-        self.use_stablemax = use_stablemax
-
-    def forward(self, x):
-        B, S, D = x.shape
-        qkv = self.qkv(x).reshape(B, S, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4)  # 3 x (B, H, S, D_h)
-
-        if self.use_stablemax != "none":
-            attn = (q @ k.transpose(-2, -1)) * self.scale
-            attn = stablemax(attn, variant=self.use_stablemax, dim=-1)
-            out = attn @ v
-        else:
-            out = F.scaled_dot_product_attention(q, k, v)
-
-        out = out.transpose(1, 2).reshape(B, S, D)
-        return self.out_proj(out)
-
+from .stablemax import SelfAttention
+from .rotary import RotaryPositionEmbedding, Rotor
 
 # ============================================================
 # Recursive Transformer Block (Section 3.6, Fig 2)
@@ -175,8 +58,8 @@ class RecursiveBlock(nn.Module):
         self.layers = nn.ModuleList()
         for _ in range(2):  # ×2 sub-layers
             layer = nn.ModuleDict({
-                "norm1": RMSNorm(dim),  # post-norm after mixer + residual
-                "norm2": RMSNorm(dim),  # post-norm after MLP + residual
+                "norm1": nn.RMSNorm(dim),  # post-norm after mixer + residual
+                "norm2": nn.RMSNorm(dim),  # post-norm after MLP + residual
                 "mlp": nn.Sequential(
                     nn.Linear(dim, dim * mlp_ratio),
                     nn.Tanh(),
@@ -186,12 +69,13 @@ class RecursiveBlock(nn.Module):
             if use_attention:
                 layer["mixer"] = SelfAttention(dim, num_heads, use_stablemax)
             else:
+                assert False, "broken at the moment"
                 layer["mixer"] = MLPMixer(seq_len, dim)
             self.layers.append(layer)
 
-    def forward(self, x):
+    def forward(self, x, p_emb):
         for layer in self.layers:
-            x = layer["norm1"](x + layer["mixer"](x))   # post-norm
+            x = layer["norm1"](x + layer["mixer"](x, p_emb))   # post-norm
             x = layer["norm2"](x + layer["mlp"](x))     # post-norm
         return x
 
@@ -268,6 +152,7 @@ class PonderBlock(nn.Module):
             return z * (1.0 + noise)
 
     def forward(self, x: torch.Tensor,
+                pos_emb: Rotor,
                 z_H: Optional[torch.Tensor] = None,
                 z_L: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -289,9 +174,9 @@ class PonderBlock(nn.Module):
 
         for _ in range(self.N_H):
             for _ in range(self.N_L):
-                z_L = self.block(z_H + z_L + x)
+                z_L = self.block(z_H + z_L + x, pos_emb)
                 z_L = self._inject_noise(z_L)
-            z_H = self.block(z_H + z_L)
+            z_H = self.block(z_H + z_L, pos_emb)
             z_H = self._inject_noise(z_H)
 
         return z_H, z_L, self.q_head(z_H)
@@ -338,6 +223,9 @@ class CMM(nn.Module):
         self.use_stablemax = use_stablemax
 
         self.input_embed = nn.Embedding(n_vocab, dim)
+        self.pos_embed = RotaryPositionEmbedding(dim,
+                                                 num_heads,
+                                                 seq_len)
         self.output_embed = nn.Linear(dim, n_vocab)
 
         self.ponder = PonderBlock(
@@ -368,7 +256,8 @@ class CMM(nn.Module):
             dict with: logits, z_H, z_L, q_values
         """
         x_emb = self.input_embed(x)
-        z_H, z_L, q_values = self.ponder(x_emb, z_H, z_L)
+        p_emb = self.pos_embed(x.shape[1])
+        z_H, z_L, q_values = self.ponder(x_emb, p_emb, z_H, z_L)
 
         return {
             "logits": self.output_embed(z_H),
@@ -383,7 +272,7 @@ class CMM(nn.Module):
 # ============================================================
 
 def equilibrium_loss(z_H: torch.Tensor, z_L: torch.Tensor,
-                     block: RecursiveBlock) -> torch.Tensor:
+                     block: RecursiveBlock, p_emb) -> torch.Tensor:
     """
     Equilibrium loss (Eq 30):
     L_equil = [ẑ_H - F̂_H(ẑ_H + ẑ_L; θ_H)]²
@@ -393,12 +282,12 @@ def equilibrium_loss(z_H: torch.Tensor, z_L: torch.Tensor,
     that cause instability.
     """
     inp = (z_H + z_L).detach()
-    target = block(inp)
+    target = block(inp, p_emb)
     return F.mse_loss(z_H, target)
 
 
 def routh_hurwitz_stable_loss(z: torch.Tensor,
-                              block: RecursiveBlock) -> torch.Tensor:
+                              block: RecursiveBlock, p_emb) -> torch.Tensor:
     """
     RH stability loss (Eq 31):
     L_RH_stable = [ReLU(1/K Σ J_ii - 1)]²
@@ -409,7 +298,7 @@ def routh_hurwitz_stable_loss(z: torch.Tensor,
     Uses finite-difference approximation of the Jacobian diagonal.
     """
     z_req = z.detach().requires_grad_(True)
-    Fz = block(z_req)
+    Fz = block(z_req, p_emb)
     # Approximate trace of Jacobian via random projection (Hutchinson's trick)
     v = torch.randn_like(z_req)
     Fz_v = (Fz * v).sum()
@@ -421,7 +310,7 @@ def routh_hurwitz_stable_loss(z: torch.Tensor,
 
 
 def routh_hurwitz_unstable_loss(z: torch.Tensor,
-                                block: RecursiveBlock) -> torch.Tensor:
+                                block: RecursiveBlock, p_emb) -> torch.Tensor:
     """
     RH unstable loss (Eq 32):
     L_RH_unstable = [ReLU(1 - 1/K Σ J_ii)]²
@@ -430,7 +319,7 @@ def routh_hurwitz_unstable_loss(z: torch.Tensor,
     unstable equilibrium point ẑ_H = x̃ (repeller).
     """
     z_req = z.detach().requires_grad_(True)
-    Fz = block(z_req)
+    Fz = block(z_req, p_emb)
     v = torch.randn_like(z_req)
     Fz_v = (Fz * v).sum()
     grad_v = torch.autograd.grad(Fz_v, z_req, create_graph=True)[0]
@@ -585,6 +474,7 @@ class CMMTrainer:
         result: dict[str, torch.Tensor],
         y_true: torch.Tensor,
         x_emb: torch.Tensor,
+        p_emb,
         compute_expensive: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Compute loss components for one supervision segment.
@@ -619,12 +509,12 @@ class CMMTrainer:
 
         if compute_expensive:
             # Equilibrium losses (Eq 30) — one extra block forward
-            losses["equil_z"] = equilibrium_loss(z_H, z_L, block)
-            losses["equil_x"] = equilibrium_loss(x_emb, torch.zeros_like(x_emb), block)
+            losses["equil_z"] = equilibrium_loss(z_H, z_L, block, p_emb)
+            losses["equil_x"] = equilibrium_loss(x_emb, torch.zeros_like(x_emb), block, p_emb)
 
             # RH stability losses (Eqs 31-32) — block forward + autograd
-            losses["RH_stable_z"] = routh_hurwitz_stable_loss(z_H + z_L, block)
-            losses["RH_unstable_x"] = routh_hurwitz_unstable_loss(x_emb, block)
+            losses["RH_stable_z"] = routh_hurwitz_stable_loss(z_H + z_L, block, p_emb)
+            losses["RH_unstable_x"] = routh_hurwitz_unstable_loss(x_emb, block, p_emb)
         else:
             zero = torch.tensor(0.0, device=device)
             losses["equil_z"] = zero
@@ -691,8 +581,9 @@ class CMMTrainer:
 
         for seg in range(self.N_super):
             x_emb = self.model.input_embed(x)
+            p_emb = self.model.pos_embed(x.shape[1])
             # Forward reasoning pass
-            z_H_new, z_L_new, q_values = self.model.ponder(x_emb, z_H, z_L)
+            z_H_new, z_L_new, q_values = self.model.ponder(x_emb, p_emb, z_H, z_L)
 
             result = {
                 "logits": self.model.output_embed(z_H_new),
@@ -704,7 +595,7 @@ class CMMTrainer:
             # Only compute expensive losses (equilibrium, RH) on last segment
             # where z_H should actually be near the fixed point
             is_last = (seg == self.N_super - 1)
-            losses = self.compute_losses(result, y, x_emb,
+            losses = self.compute_losses(result, y, x_emb, p_emb,
                                          compute_expensive=is_last)
             total = self.weighted_loss(losses) / N_accum
 

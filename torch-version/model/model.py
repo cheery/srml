@@ -30,6 +30,7 @@ from .cmm import (
     PonderBlock, equilibrium_loss, routh_hurwitz_stable_loss,
     routh_hurwitz_unstable_loss, repulsion_loss,
 )
+from .rotary import RotaryPositionEmbedding
 
 @dataclass
 class GMemConfig:
@@ -97,9 +98,9 @@ class SRLMPonder(nn.Module):
                                             cfg.num_heads)
 
     def get_front(self, xt, memory):
-        h, cos, sin = self.input(xt)
+        h, p_emb = self.input(xt)
         h, importance_scores = self.front_memory(h, memory)
-        return h, cos, sin, importance_scores
+        return h, p_emb, importance_scores
 
     def init_states(self, h):
         z_H = h.clone()
@@ -140,26 +141,26 @@ class SRLMDenoiser(nn.Module):
                            self.cfg.gmem.memory_dim, device=device)
 
     def get_front(self, xt, t, memory=None):
-        h, c, cos, sin = self.input(xt, t)
+        h, c, p_emb = self.input(xt, t)
         for layer in self.front_layers:
-            h = layer(h, c, cos, sin)
+            h = layer(h, c, p_emb)
         if memory is None:
             memory = self.init_memory(h.shape[0], h.device)
         h, memory, importance_scores = self.latent_memory(h, memory)
-        return h, c, cos, sin, memory, importance_scores
+        return h, c, p_emb, memory, importance_scores
 
-    def get_back(self, h, c, cos, sin):
+    def get_back(self, h, c, p_emb):
         for layer in self.back_layers:
-            h = layer(h, c, cos, sin)
+            h = layer(h, c, p_emb)
         return h
 
-    def get_behind(self, h, c, cos, sin):
-        h = self.get_back(h, c, cos, sin)
+    def get_behind(self, h, c, p_emb):
+        h = self.get_back(h, c, p_emb)
         return self.out_proj(h)
 
     def get_hidden(self, xt, t, memory=None):
-        h, c, cos, sin, memory, importance_scores = self.get_front(xt, t, memory)
-        h = self.get_back(h, c, cos, sin)
+        h, c, p_emb, memory, importance_scores = self.get_front(xt, t, memory)
+        h = self.get_back(h, c, p_emb)
         return h, memory, importance_scores
 
     def forward(self, xt, t, memory=None):
@@ -173,14 +174,9 @@ class BaseInputLayer(nn.Module):
     def __init__(self, dim, num_heads, max_context_length):
         super().__init__()
         self.dim = dim
-        # Rotary position embeddings
-        head_dim = dim // num_heads
-        half = head_dim // 2
-        freqs = 1.0 / (10000.0 ** (torch.arange(half).float() / half))
-        pos = torch.arange(max_context_length).float()
-        angles = pos[:, None] * freqs[None, :]
-        self.register_buffer("rot_cos", torch.cos(angles), persistent=False)
-        self.register_buffer("rot_sin", torch.sin(angles), persistent=False)
+        self.pos_embed = RotaryPositionEmbedding(dim,
+                                                 num_heads,
+                                                 max_context_length)
 
 class UnmaskedInputLayer(BaseInputLayer):
     def __init__(self, vocab_size, dim, num_heads, max_context_length):
@@ -190,9 +186,8 @@ class UnmaskedInputLayer(BaseInputLayer):
     def forward(self, x):
         B, L = x.shape
         h = self.tok_embed(x)
-        cos = self.rot_cos[:L][None, None, :, :]
-        sin = self.rot_sin[:L][None, None, :, :]
-        return h, cos, sin
+        p = self.pos_embed(L)
+        return h, p
 
 class MaskedInputLayer(BaseInputLayer):
     def __init__(self, vocab_size, dim, num_heads, max_context_length):
@@ -217,9 +212,8 @@ class MaskedInputLayer(BaseInputLayer):
         B, L = x.shape
         h = self.tok_embed(x)
         c = self._time_embed(t)
-        cos = self.rot_cos[:L][None, None, :, :]
-        sin = self.rot_sin[:L][None, None, :, :]
-        return h, c, cos, sin
+        pos = self.pos_embed(L)
+        return h, c, pos
 
 class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio, dropout=0.0):
@@ -239,10 +233,10 @@ class Block(nn.Module):
         self.drop_attn = nn.Dropout(dropout)
         self.drop_mlp  = nn.Dropout(dropout)
 
-    def forward(self, y, c, cos, sin):
+    def forward(self, y, c, p_emb):
         g1, b1, a1, g2, b2, a2 = self.adaln(c).unsqueeze(1).chunk(6, dim=-1)
         h = self.norm1(y) * (1 + g1) + b1
-        y = y + a1 * self.drop_attn(self.attn(h, cos, sin))
+        y = y + a1 * self.drop_attn(self.attn(h, p_emb))
         h = self.norm2(y) * (1 + g2) + b2
         y = y + a2 * self.drop_mlp(self.mlp(h))
         return y
@@ -255,21 +249,15 @@ class SelfAttention(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.out_proj = nn.Linear(dim, dim)
 
-    def forward(self, h, cos, sin):
+    def forward(self, h, pos):
         B, L, _ = h.shape
         qkv = self.qkv(h).reshape(B, L, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4)
-        q = _apply_rotary(q, cos, sin)
-        k = _apply_rotary(k, cos, sin)
+        q = pos(q)
+        k = pos(k)
         out = F.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).reshape(B, L, -1)
         return self.out_proj(out)
-
-def _apply_rotary(x, cos, sin):
-    d = x.shape[-1] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    return torch.cat([x1 * cos - x2 * sin,
-                      x2 * cos + x1 * sin], dim=-1)
 
 
 # ============================================================
@@ -402,10 +390,10 @@ def ponder_forward(ponder, denoiser, x0, xt, t, memory=None, n_ponder=3):
         memory = denoiser.init_memory(x0.shape[0], x0.device)
 
     # Ponder reads clean context into memory
-    h_p, cos_p, sin_p, importance_scores = ponder.get_front(x0, memory)
+    h_p, p_emb, importance_scores = ponder.get_front(x0, memory)
     z_H, z_L = ponder.init_states(h_p)
     for _ in range(n_ponder):
-        z_H, z_L, q_values = ponder.ponder(h_p, z_H, z_L)
+        z_H, z_L, q_values = ponder.ponder(h_p, p_emb, z_H, z_L)
     memory = ponder(z_H, memory)
 
     # Denoiser uses enriched memory
@@ -486,7 +474,7 @@ class PonderTrainer:
         loss_fn = MDLMLoss(self.schedule, mask_id, t_min=t_min)
 
         # Ponder front once: embed ponder_input, read from memory
-        h_ponder, _, _, importance_scores = ponder.get_front(ponder_input, memory)
+        h_ponder, _, importance_scores = ponder.get_front(ponder_input, memory)
         z_H, z_L = ponder.init_states(h_ponder)
 
         all_losses = {k: 0.0 for k in [
@@ -498,8 +486,8 @@ class PonderTrainer:
             xt, t, is_masked = loss_fn.perturb(x0, answer_mask=answer_mask)
 
             # PonderBlock iteration
-            h_ponder, _, _, importance_scores = ponder.get_front(ponder_input, memory)
-            z_H_new, z_L_new, q_values = ponder.ponder(h_ponder, z_H, z_L)
+            h_ponder, p_emb, importance_scores = ponder.get_front(ponder_input, memory)
+            z_H_new, z_L_new, q_values = ponder.ponder(h_ponder, p_emb, z_H, z_L)
 
             # Write ponder result to memory
             memory = ponder(z_H_new, memory)
@@ -527,9 +515,9 @@ class PonderTrainer:
             is_last = (seg == self.N_super - 1)
             if is_last:
                 block = ponder.ponder.block
-                losses["equil"] = equilibrium_loss(z_H_new, z_L_new, block)
+                losses["equil"] = equilibrium_loss(z_H_new, z_L_new, block, p_emb)
                 losses["RH_stable"] = routh_hurwitz_stable_loss(
-                    z_H_new + z_L_new, block)
+                    z_H_new + z_L_new, block, p_emb)
             else:
                 losses["equil"] = torch.tensor(0.0, device=device)
                 losses["RH_stable"] = torch.tensor(0.0, device=device)
