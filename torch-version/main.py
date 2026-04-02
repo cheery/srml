@@ -26,7 +26,7 @@ import torch.optim as optim
 
 from model.model import (
     SRLMConfig, GMemConfig, PonderConfig,
-    SRLMDenoiser, SRLMEnergyModel, SRLMPonder,
+    SRLMDenoiser, SRLMEnergyModel,
     mdlm_loss, nce_loss, sample, PonderTrainer,
 )
 from model.gmem import MemoryLoss
@@ -106,11 +106,9 @@ def sample_batch_random(raw: torch.Tensor, seq_len: int, batch: int) -> torch.Te
 
 def save_checkpoint(ckpt_dir: Path, model: nn.Module, config: SRLMConfig,
                     training_log: str, wiki_state: dict | None = None,
-                    ema=None, ponder=None):
+                    ema=None):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), ckpt_dir / "parameters.pt")
-    if ponder is not None:
-        torch.save(ponder.state_dict(), ckpt_dir / "ponder.pt")
     if ema is not None:
         torch.save(ema.state_dict(), ckpt_dir / "ema.pt")
     with open(ckpt_dir / "config.json", "w") as f:
@@ -202,9 +200,9 @@ class MemoryReplayBuffer:
         for i, (tokens, _, answer_mask) in enumerate(self.entries):
             x0 = tokens.to(device)
             t_zero = torch.zeros(x0.shape[0], device=device)
-            h, c, cos, sin = denoiser.input(x0, t_zero)
+            h, c, p_emb = denoiser.input(x0, t_zero)
             for layer in denoiser.front_layers:
-                h = layer(h, c, cos, sin)
+                h = layer(h, c, p_emb)
             memory = denoiser.init_memory(x0.shape[0], device)
             _, memory, _ = denoiser.latent_memory(h, memory)
             self.entries[i] = (tokens, memory.detach().cpu(), answer_mask)
@@ -313,9 +311,9 @@ class ArithmeticProgram:
             Lp = min(len(prompt_tok), self.seq_len)
             batch[i, :L] = full_tok[:L]
             prompt_batch[i, :Lp] = prompt_tok[:Lp]
-            answer_mask[i, Lp:L] = True
+            answer_mask[i, Lp:self.seq_len] = True
         self.step_count += 1
-        return batch, answer_mask, prompt_batch
+        return batch, answer_mask
 
     def description(self):
         return f"arithmetic({self.max_steps or 'inf'}, done={self.step_count})"
@@ -488,17 +486,8 @@ def cmd_train(args):
     print(f"Denoiser params:  {param_count(denoiser):,}")
     print(f"Denoiser memory:  {param_memory_mb(denoiser):.1f} MB")
 
-    ponder_model = SRLMPonder(config).to(device)
-    ponder_path = ckpt_path / "ponder.pt"
-    if ponder_path.exists():
-        ponder_model.load_state_dict(
-            torch.load(ponder_path, map_location=device, weights_only=True))
-        print(f"Loaded ponder from {ponder_path}")
-    print(f"Ponder params:    {param_count(ponder_model):,}")
-
     # Optimizer covers both denoiser and ponder
-    all_params = list(denoiser.parameters()) + list(ponder_model.parameters())
-    optimizer = optim.AdamW(all_params, lr=args.lr, weight_decay=0.01)
+    optimizer = optim.AdamW(denoiser.parameters(), lr=args.lr, weight_decay=0.01)
     ema = EMA(denoiser, mu=0.999)
     mem_loss_fn = MemoryLoss()
 
@@ -509,7 +498,6 @@ def cmd_train(args):
 
     # Ponder trainer
     ponder_trainer = PonderTrainer(
-        ponder=ponder_model,
         denoiser=denoiser,
         schedule=schedule,
         N_super=args.supervision,
@@ -670,8 +658,6 @@ def cmd_train(args):
                         answer_mask=answer_mask,
                         K=args.grpo_k,
                         sampling_steps=args.grpo_steps,
-                        ponder=ponder_model,
-                        n_ponder=3,
                         verbose=(global_step % args.report_every == 0),
                     )
                     ema.update(denoiser)
@@ -770,7 +756,7 @@ def cmd_train(args):
                         wiki_state = p.wiki_state()
                 log = "\n".join(training_log_lines)
                 log += f"\nsaved at step {global_step}"
-                save_checkpoint(ckpt_path, denoiser, config, log, wiki_state, ema=ema, ponder=ponder_model)
+                save_checkpoint(ckpt_path, denoiser, config, log, wiki_state, ema=ema)
 
             if global_step % args.sample_every == 0:
                 denoiser.eval()
@@ -799,7 +785,7 @@ def cmd_train(args):
     for p in programs:
         if isinstance(p, WikipediaProgram):
             wiki_state = p.wiki_state()
-    save_checkpoint(ckpt_path, denoiser, config, log, wiki_state, ema=ema, ponder=ponder_model)
+    save_checkpoint(ckpt_path, denoiser, config, log, wiki_state, ema=ema)
     print(f"Done. {global_step} steps in {elapsed}.")
 
 
@@ -823,15 +809,6 @@ def cmd_eval(args):
         print(f"No checkpoint found at {ckpt_path}")
         sys.exit(1)
 
-    ponder_model = SRLMPonder(config).to(device)
-    ponder_path = ckpt_path / "ponder.pt"
-    if ponder_path.exists():
-        ponder_model.load_state_dict(
-            torch.load(ponder_path, map_location=device, weights_only=True))
-        print(f"Loaded ponder from {ponder_path}")
-    else:
-        print("Warning: no ponder.pt found, ponder weights are random")
-
     if args.ema:
         ema_path = ckpt_path / "ema.pt"
         if ema_path.exists():
@@ -843,9 +820,7 @@ def cmd_eval(args):
             print("Warning: --ema requested but no ema.pt found")
 
     denoiser.eval()
-    ponder_model.eval()
     print(f"Denoiser params: {param_count(denoiser):,}")
-    print(f"Ponder params:   {param_count(ponder_model):,}")
 
     # Session-persistent memory
     memory = denoiser.init_memory(1, device)
@@ -853,7 +828,6 @@ def cmd_eval(args):
     puzzles = None
     solutions = None
 
-    print(f"\nPonder reads your input into memory, denoiser generates response.")
     print(f"Memory persists across the session ({config.gmem.num_slots} slots).")
     print(f"Commands: !reset  !sudoku  !ponder N  (empty line = free generate)")
     print()
@@ -911,12 +885,12 @@ def cmd_eval(args):
             p_len = min(len(puz_tokens), seq_len)
             ponder_input[0, :p_len] = puz_tokens[:p_len].to(device)
 
-            with torch.no_grad():
-                h_p, p_emb, _ = ponder_model.get_front(ponder_input, memory)
-                z_H, z_L = ponder_model.init_states(h_p)
-                for _ in range(n_ponder):
-                    z_H, z_L, _ = ponder_model.ponder(h_p, p_emb, z_H, z_L)
-                memory = ponder_model(z_H, memory)
+            #with torch.no_grad():
+            #    h_p, p_emb, _ = ponder_model.get_front(ponder_input, memory)
+            #    z_H, z_L = ponder_model.init_states(h_p)
+            #    for _ in range(n_ponder):
+            #        z_H, z_L, _ = ponder_model.ponder(h_p, p_emb, z_H, z_L)
+            #    memory = ponder_model(z_H, memory)
 
             # Denoiser generates with clue clamping
             clue_mask = (puz_tokens != ord('0'))
@@ -929,9 +903,10 @@ def cmd_eval(args):
             cv = clue_values[:q_len].to(device)
             xt[0, :q_len] = torch.where(cm, cv, xt[0, :q_len])
 
+            z = None
             with torch.no_grad():
                 for step in stepper:
-                    logits, memory, _ = denoiser(xt, step.t, memory)
+                    z, logits, memory, _ = denoiser(z, xt, step.t, memory)
                     x0 = step.propose_x0(xt, logits)
                     xt = step.reverse_step(xt, x0)
                     xt[0, :q_len] = torch.where(cm, cv, xt[0, :q_len])
@@ -961,24 +936,25 @@ def cmd_eval(args):
 
         if query is not None and len(query) > 0:
             # Step 1: Ponder reads user input into session memory
-            ponder_input = torch.full((1, seq_len), ord(' '), dtype=torch.int32, device=device)
-            q_len = min(len(query), seq_len)
-            ponder_input[0, :q_len] = query[:q_len].to(device)
+            #ponder_input = torch.full((1, seq_len), ord(' '), dtype=torch.int32, device=device)
+            #ponder_input[0, :q_len] = query[:q_len].to(device)
 
-            with torch.no_grad():
-                h_p, p_emb, _ = ponder_model.get_front(ponder_input, memory)
-                z_H, z_L = ponder_model.init_states(h_p)
-                for _ in range(n_ponder):
-                    z_H, z_L, _ = ponder_model.ponder(h_p, p_emb, z_H, z_L)
-                memory = ponder_model(z_H, memory)
+            #with torch.no_grad():
+            #    h_p, p_emb, _ = ponder_model.get_front(ponder_input, memory)
+            #    z_H, z_L = ponder_model.init_states(h_p)
+            #    for _ in range(n_ponder):
+            #        z_H, z_L, _ = ponder_model.ponder(h_p, p_emb, z_H, z_L)
+            #    memory = ponder_model(z_H, memory)
 
             # Step 2: Denoiser generates from all-masked using enriched memory
             sampler_obj = Sampler(schedule, MASK_TOKEN, VOCAB_SIZE)
             xt, stepper = sampler_obj(1, seq_len, device, args.steps)
-
+            q_len = min(len(query), seq_len)
+            xt[0, :q_len] = query[:q_len].to(device)
+            z = None
             with torch.no_grad():
                 for step in stepper:
-                    logits, memory, _ = denoiser(xt, step.t, memory)
+                    z, logits, memory, _ = denoiser(z, xt, step.t, memory)
                     x0 = step.propose_x0(xt, logits)
                     xt = step.reverse_step(xt, x0)
 
@@ -987,10 +963,11 @@ def cmd_eval(args):
             # Empty input: free generate from current memory state
             sampler_obj = Sampler(schedule, MASK_TOKEN, VOCAB_SIZE)
             xt, stepper = sampler_obj(1, seq_len, device, args.steps)
+            z = None
 
             with torch.no_grad():
                 for step in stepper:
-                    logits, memory, _ = denoiser(xt, step.t, memory)
+                    z, logits, memory, _ = denoiser(z, xt, step.t, memory)
                     x0 = step.propose_x0(xt, logits)
                     xt = step.reverse_step(xt, x0)
 
@@ -1033,8 +1010,8 @@ def main():
     p_train.add_argument("--report-every", type=int, default=10, dest="report_every")
     p_train.add_argument("--sample-every", type=int, default=500, dest="sample_every")
     # Ponder
-    p_train.add_argument("--supervision", type=int, default=16,
-                         help="Ponder supervision segments (default: 16)")
+    p_train.add_argument("--supervision", type=int, default=8,
+                         help="Ponder supervision segments (default: 8)")
     p_train.add_argument("--ponder-every", type=int, default=0, dest="ponder_every",
                          help="Interleave ponder training every N steps (0=off)")
     # Memory replay (Anki-style)

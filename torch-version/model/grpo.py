@@ -16,8 +16,6 @@ Flow:
 import torch
 import torch.nn.functional as F
 from .edlm import MDLMLoss, mask_tokens, Sampler
-from .model import ponder_forward
-
 
 # ---------------------------------------------------------------------------
 # Reward functions
@@ -133,8 +131,6 @@ def grpo_step(
     epochs=5,
     beta_dgpo=1.0,       # DGPO sigmoid temperature
     t_min=1e-4,
-    ponder=None,         # SRLMPonder for ponder-enhanced forward (None=off)
-    n_ponder=3,          # ponder iterations when ponder is provided
 ):
     """DGPO-style GRPO update for masked discrete diffusion.
 
@@ -143,10 +139,6 @@ def grpo_step(
     3. Compute group-relative z-score advantages
     4. Cache reference CE loss (model before optimization)
     5. Optimize with DGPO loss: sigma(group_drift) * advantage * CE_loss
-
-    When ponder is provided, both sampling and loss computation use the
-    ponder-enhanced forward path (ponder reads clean → denoiser reads
-    enriched memory), so the PonderBlock gets GRPO reward signal gradients.
     """
     B, L = prompt_batch.shape
     n_vocab = denoiser.cfg.vocab_size
@@ -157,15 +149,6 @@ def grpo_step(
 
     # Visible positions: not masked in prompt
     visible = (prompt_batch != mask_id)
-
-    # Forward function: plain or ponder-enhanced
-    def _forward(x0, xt, t, mem):
-        if ponder is not None:
-            logits, memory, im1, im2 = ponder_forward(ponder, denoiser, x0, xt, t, mem,
-                                  n_ponder=n_ponder)
-            return logits, memory, im1
-        else:
-            return denoiser(xt, t, mem)
 
     denoiser.eval()
 
@@ -179,15 +162,13 @@ def grpo_step(
 
     sampler = Sampler(schedule, mask_id, n_vocab)
     xt, stepper = sampler(B * K, L, device, sampling_steps)
+    z = None
 
     with torch.no_grad():
-        # For sampling with ponder: use prompt as clean context
-        clean_expanded = clean_batch.repeat_interleave(K, dim=0)
         for s in stepper:
             # Clamp visible (query) positions each step
             xt = torch.where(visible_expanded, prompt_expanded, xt)
-            logits, memory_expanded, _ = _forward(
-                clean_expanded, xt, s.t, memory_expanded)
+            z, logits, memory_expanded, _ = denoiser(z, xt, s.t, memory_expanded)
             x0 = s.propose_x0(xt, logits)
             xt = s.reverse_step(xt, x0)
 
@@ -240,7 +221,7 @@ def grpo_step(
                 # Keep visible/query positions clean
                 xt_k = torch.where(visible, prompt_batch, xt_k)
 
-                logits_k, _, _ = _forward(candidate_k, xt_k, t_k, memory)
+                _, logits_k, _, _ = denoiser(None, xt_k, t_k, memory)
                 ref_loss = loss_fn(logits_k, candidate_k, is_masked_k)
 
                 ep_data.append({
@@ -264,7 +245,7 @@ def grpo_step(
         losses_k = []
         for k in range(K):
             c = ref_cache[ep][k]
-            logits_k, _, _ = _forward(c['candidate'], c['xt'], c['t'], memory)
+            _, logits_k, _, _ = denoiser(None, c['xt'], c['t'], memory)
             loss_k = loss_fn(logits_k, c['candidate'], c['is_masked'])
             losses_k.append(loss_k)
 
@@ -288,8 +269,6 @@ def grpo_step(
         n_steps += 1
 
         torch.nn.utils.clip_grad_norm_(denoiser.parameters(), grad_clip)
-        if ponder is not None:
-            torch.nn.utils.clip_grad_norm_(ponder.parameters(), grad_clip)
         optimizer.step()
 
     # Detach memory for return

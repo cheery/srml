@@ -51,32 +51,35 @@ class RecursiveBlock(nn.Module):
     residual addition, preventing representation blowup during deep recursion.
     Uses tanh activation for contraction mapping properties (Section 3.6).
     """
-    def __init__(self, dim: int, seq_len: int, num_heads: int = 4,
+    def __init__(self, dim: int, num_heads: int = 4,
                  mlp_ratio: int = 4, use_attention: bool = False,
                  use_stablemax: str = "none"):
         super().__init__()
         self.layers = nn.ModuleList()
         for _ in range(2):  # ×2 sub-layers
             layer = nn.ModuleDict({
-                "norm1": nn.RMSNorm(dim),  # post-norm after mixer + residual
-                "norm2": nn.RMSNorm(dim),  # post-norm after MLP + residual
+                "adaln": nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim)),
+
+                "norm1": nn.LayerNorm(dim, elementwise_affine=False),
+                "norm2": nn.LayerNorm(dim, elementwise_affine=False),
+                "rms1": nn.RMSNorm(dim),
+                "rms2": nn.RMSNorm(dim),
                 "mlp": nn.Sequential(
                     nn.Linear(dim, dim * mlp_ratio),
                     nn.Tanh(),
                     nn.Linear(dim * mlp_ratio, dim),
                 ),
+                "mixer": SelfAttention(dim, num_heads, use_stablemax),
             })
-            if use_attention:
-                layer["mixer"] = SelfAttention(dim, num_heads, use_stablemax)
-            else:
-                assert False, "broken at the moment"
-                layer["mixer"] = MLPMixer(seq_len, dim)
             self.layers.append(layer)
 
-    def forward(self, x, p_emb):
+    def forward(self, x, c, p_emb):
         for layer in self.layers:
-            x = layer["norm1"](x + layer["mixer"](x, p_emb))   # post-norm
-            x = layer["norm2"](x + layer["mlp"](x))     # post-norm
+            g1, b1, a1, g2, b2, a2 = layer["adaln"](c).unsqueeze(1).chunk(6, dim=-1)
+            h = layer["norm1"](x) * (1 + g1) + b1
+            x = layer["rms1"](x + a1 * layer["mixer"](h, p_emb))
+            h = layer["norm2"](x) * (1 + g2) + b2
+            x = layer["rms2"](x + a2 * layer["mlp"](h))
         return x
 
 
@@ -125,7 +128,7 @@ class PonderBlock(nn.Module):
     def __init__(self, dim: int, max_context_length: int,
                  num_heads: int = 4, mlp_ratio: int = 4,
                  N_H: int = 3, N_L: int = 6,
-                 noise_sigma: float = 0.0,
+                 noise_sigma: float = 0.01,
                  noise_type: str = "additive",
                  use_attention: bool = False,
                  use_stablemax: str = "3"):
@@ -136,7 +139,7 @@ class PonderBlock(nn.Module):
         self.noise_type = noise_type
 
         self.block = RecursiveBlock(
-            dim, max_context_length, num_heads, mlp_ratio,
+            dim, num_heads, mlp_ratio,
             use_attention, use_stablemax,
         )
         self.q_head = QHead(dim, max_context_length)
@@ -152,9 +155,10 @@ class PonderBlock(nn.Module):
             return z * (1.0 + noise)
 
     def forward(self, x: torch.Tensor,
+                c: torch.Tensor,
                 pos_emb: Rotor,
-                z_H: Optional[torch.Tensor] = None,
-                z_L: Optional[torch.Tensor] = None,
+                z_H: torch.Tensor,
+                z_L: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -167,16 +171,11 @@ class PonderBlock(nn.Module):
             z_L:      final low-level state (B, S, D)
             q_values: halt/continue Q-values (B, 2)
         """
-        if z_H is None:
-            z_H = x.clone()
-        if z_L is None:
-            z_L = torch.zeros_like(x)
-
         for _ in range(self.N_H):
             for _ in range(self.N_L):
-                z_L = self.block(z_H + z_L + x, pos_emb)
+                z_L = self.block(z_H + z_L + x, c, pos_emb)
                 z_L = self._inject_noise(z_L)
-            z_H = self.block(z_H + z_L, pos_emb)
+            z_H = self.block(z_H + z_L, c, pos_emb)
             z_H = self._inject_noise(z_H)
 
         return z_H, z_L, self.q_head(z_H)
@@ -272,7 +271,7 @@ class CMM(nn.Module):
 # ============================================================
 
 def equilibrium_loss(z_H: torch.Tensor, z_L: torch.Tensor,
-                     block: RecursiveBlock, p_emb) -> torch.Tensor:
+                     block: RecursiveBlock, c, p_emb) -> torch.Tensor:
     """
     Equilibrium loss (Eq 30):
     L_equil = [ẑ_H - F̂_H(ẑ_H + ẑ_L; θ_H)]²
@@ -282,12 +281,12 @@ def equilibrium_loss(z_H: torch.Tensor, z_L: torch.Tensor,
     that cause instability.
     """
     inp = (z_H + z_L).detach()
-    target = block(inp, p_emb)
+    target = block(inp, c, p_emb)
     return F.mse_loss(z_H, target)
 
 
 def routh_hurwitz_stable_loss(z: torch.Tensor,
-                              block: RecursiveBlock, p_emb) -> torch.Tensor:
+                              block: RecursiveBlock, c, p_emb) -> torch.Tensor:
     """
     RH stability loss (Eq 31):
     L_RH_stable = [ReLU(1/K Σ J_ii - 1)]²
@@ -298,7 +297,7 @@ def routh_hurwitz_stable_loss(z: torch.Tensor,
     Uses finite-difference approximation of the Jacobian diagonal.
     """
     z_req = z.detach().requires_grad_(True)
-    Fz = block(z_req, p_emb)
+    Fz = block(z_req, c, p_emb)
     # Approximate trace of Jacobian via random projection (Hutchinson's trick)
     v = torch.randn_like(z_req)
     Fz_v = (Fz * v).sum()
@@ -310,7 +309,7 @@ def routh_hurwitz_stable_loss(z: torch.Tensor,
 
 
 def routh_hurwitz_unstable_loss(z: torch.Tensor,
-                                block: RecursiveBlock, p_emb) -> torch.Tensor:
+                                block: RecursiveBlock, c, p_emb) -> torch.Tensor:
     """
     RH unstable loss (Eq 32):
     L_RH_unstable = [ReLU(1 - 1/K Σ J_ii)]²
@@ -319,7 +318,7 @@ def routh_hurwitz_unstable_loss(z: torch.Tensor,
     unstable equilibrium point ẑ_H = x̃ (repeller).
     """
     z_req = z.detach().requires_grad_(True)
-    Fz = block(z_req, p_emb)
+    Fz = block(z_req, c, p_emb)
     v = torch.randn_like(z_req)
     Fz_v = (Fz * v).sum()
     grad_v = torch.autograd.grad(Fz_v, z_req, create_graph=True)[0]
