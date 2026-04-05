@@ -623,7 +623,7 @@ def cmd_train(args):
             if ponder_x0 is not None:
                 ponder_x0 = ponder_x0.to(device)
 
-            is_reasoning = False # isinstance(program, (SudokuProgram, ArithmeticProgram, QAProgram))
+            is_reasoning = isinstance(program, (SudokuProgram, ArithmeticProgram, QAProgram))
 
             # Determine if this is a study or practice step
             if use_memory and memory_alternate > 0:
@@ -674,11 +674,13 @@ def cmd_train(args):
 
             elif is_reasoning:
                 # --- Reasoning tasks: always use ponder deep supervision ---
-                # For QA: ponder sees question only, denoiser denoises answer
+                denoiser.train()
+                optimizer.zero_grad()
                 ponder_losses, memory = ponder_trainer.train_step(
                     x0, optimizer, memory, answer_mask=answer_mask,
-                    ponder_x0=ponder_x0,
                 )
+                torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
+                optimizer.step()
                 scheduler.step()
                 ema.update(denoiser)
                 avg_loss = ponder_losses['LM']
@@ -748,9 +750,13 @@ def cmd_train(args):
 
                 # Ponder step (interleaved for non-reasoning tasks)
                 if args.ponder_every > 0 and global_step % args.ponder_every == 0:
+                    denoiser.train()
+                    optimizer.zero_grad()
                     ponder_losses, memory = ponder_trainer.train_step(
                         x0, optimizer, memory, answer_mask=answer_mask,
                     )
+                    torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
+                    optimizer.step()
                     ponder_info = f" | ponder LM={ponder_losses['LM']:.4f}"
                     scheduler.step()
 
@@ -964,11 +970,10 @@ def cmd_eval(args):
             cm = clue_mask[:q_len].to(device)
             cv = clue_values[:q_len].to(device)
             xt[0, :q_len] = torch.where(cm, cv, xt[0, :q_len])
-
-            z = None
+            memory = denoiser.pioneer(xt, None, memory)
             with torch.no_grad():
                 for step in stepper:
-                    z, logits, memory, _ = denoiser(z, xt, step.t, memory)
+                    logits = denoiser(xt, step.t, memory)
                     x0 = step.propose_x0(xt, logits)
                     xt = step.reverse_step(xt, x0)
                     xt[0, :q_len] = torch.where(cm, cv, xt[0, :q_len])
@@ -1009,27 +1014,26 @@ def cmd_eval(args):
             #    memory = ponder_model(z_H, memory)
 
             # Step 2: Denoiser generates from all-masked using enriched memory
+
             sampler_obj = Sampler(schedule, MASK_TOKEN, VOCAB_SIZE)
             xt, stepper = sampler_obj(1, seq_len, device, args.steps)
             q_len = min(len(query), seq_len)
             xt[0, :q_len] = query[:q_len].to(device)
-            z = None
+            memory = denoiser.pioneer(xt, None, memory)
             with torch.no_grad():
                 for step in stepper:
-                    z, logits, memory, _ = denoiser(z, xt, step.t, memory)
+                    logits = denoiser(xt, step.t, memory)
                     x0 = step.propose_x0(xt, logits)
                     xt = step.reverse_step(xt, x0)
-
             print(as_text(xt[0]))
         else:
             # Empty input: free generate from current memory state
             sampler_obj = Sampler(schedule, MASK_TOKEN, VOCAB_SIZE)
             xt, stepper = sampler_obj(1, seq_len, device, args.steps)
-            z = None
-
+            memory = denoiser.pioneer(xt, None, memory)
             with torch.no_grad():
                 for step in stepper:
-                    z, logits, memory, _ = denoiser(z, xt, step.t, memory)
+                    logits = denoiser(xt, step.t, memory)
                     x0 = step.propose_x0(xt, logits)
                     xt = step.reverse_step(xt, x0)
 

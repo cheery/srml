@@ -498,15 +498,20 @@ def grpo_step(
 
     # --- 1. Generate K candidates, recording on-policy trajectory ---
     denoiser.eval()
+
+    # Pioneer: let the model "think" about the prompt before generating
+    with torch.no_grad():
+        memory = denoiser.pioneer(prompt_batch, memory=memory)
+        ref_memory = ref_denoiser.pioneer(prompt_batch, memory=memory)
+
     prompt_expanded = prompt_batch.repeat_interleave(K, dim=0)
     visible_expanded = prompt_expanded != mask_id
+    memory_expanded = memory.repeat_interleave(K, dim=0)
+    ref_memory_expanded = ref_memory.repeat_interleave(K, dim=0)
 
     sampler = Sampler(schedule, mask_id, denoiser.cfg.vocab_size)
     xt, stepper = sampler(B * K, L, device, sampling_steps)
     xt = torch.where(visible_expanded, prompt_expanded, xt)
-
-    z = None
-    memory_expanded = memory.repeat_interleave(K, dim=0) if memory is not None else None
 
     trajectory = []
 
@@ -514,13 +519,13 @@ def grpo_step(
         for s in stepper:
             is_masked = (xt == mask_id)
 
-            z, logits, memory_expanded, _ = denoiser(None, xt, s.t, None)#memory_expanded)
+            logits = denoiser(xt, s.t, memory_expanded)
             x0 = s.propose_x0(xt, logits/T)
 
             old_logp = F.log_softmax(logits/T, dim=-1)
             old_logp = torch.gather(old_logp, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
 
-            _, ref_logits, _, _ = ref_denoiser(None, xt, s.t, None)
+            ref_logits = ref_denoiser(xt, s.t, ref_memory_expanded)
             ref_logp = F.log_softmax(ref_logits/T, dim=-1)
             ref_logp = torch.gather(ref_logp, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
 
@@ -531,6 +536,7 @@ def grpo_step(
                 "old_logp": old_logp.clone(),
                 "ref_logp": ref_logp.clone(),
                 "is_masked": is_masked.clone(),
+                "memory": memory_expanded,
             })
 
             xt = s.reverse_step(xt, x0)
@@ -585,7 +591,7 @@ def grpo_step(
             if not is_masked.any():
                 continue
 
-            _, logits_s, _, _ = denoiser(None, xt_s, t_s, memory=None)
+            logits_s = denoiser(xt_s, t_s, memory=step_data["memory"])
             curr_logp_s = F.log_softmax(logits_s/T, dim=-1)
             curr_logp_s = torch.gather(curr_logp_s, dim=-1, index=x0_s.unsqueeze(-1)).squeeze(-1)
 
@@ -619,4 +625,4 @@ def grpo_step(
         'mean_reward': rewards.mean().item(),
         'frac_correct': (rewards > -0.5).float().mean().item(),
     }
-    return full_loss / max(len(trajectory), 1), None, metrics
+    return full_loss / max(len(trajectory), 1), memory, metrics

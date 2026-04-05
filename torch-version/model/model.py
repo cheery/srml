@@ -86,7 +86,7 @@ class SRLMDenoiser(nn.Module):
         ])
         self.latent_memory_in = LatentMemoryIn(
                 cfg.hidden_dim,
-                cfg.gmem_memory_dim,
+                cfg.gmem.memory_dim,
                 cfg.num_heads)
         self.latent_memory = LatentMemoryBank(
                     cfg.hidden_dim,
@@ -160,7 +160,7 @@ class SRLMDenoiser(nn.Module):
         h = self.get_back(h, c, p_emb)
         return self.out_proj(h)
 
-    def get_hidden(self, z, xt, t, memory=None):
+    def get_hidden(self, xt, t, memory=None):
         h, c, p_emb = self.get_front(xt, t)
         if memory is None:
             memory = self.init_memory(h.shape[0], h.device)
@@ -331,10 +331,9 @@ def sample(denoiser, schedule, batch_size, seq_len, num_steps=256,
     mask_id = n_vocab
     sampler = Sampler(schedule, mask_id, n_vocab)
     xt, stepper = sampler(batch_size, seq_len, device, num_steps)
-    z = None
 
     for s in stepper:
-        z, logits, memory, _ = denoiser(z, xt, s.t, memory)
+        logits = denoiser(xt, s.t, memory)
         if energy_model is not None and s.tau_n >= 1.0 - window_w:
             candidates = s.propose_x0_k(xt, logits, k)       # (k, B, L)
             c_flat = candidates.reshape(k * batch_size, seq_len)
@@ -425,25 +424,23 @@ class PonderTrainer:
 
         x_in = x0.clone()
         x_in[answer_mask] = mask_id
-        t_in = self.init_t(x_in)
-        h, c, p_emb = self.get_front(x_in, t_in)
-        z_H, z_L = self.init_states(h)
+        t_in = denoiser.init_t(x_in)
+        h, c, p_emb = denoiser.get_front(x_in, t_in)
+        z_H, z_L = denoiser.init_states(h)
         
         all_losses = {k: 0.0 for k in [
             "LM", "BCE", "mem", "rep", "equil", "RH_stable", "total"
         ]}
 
         for seg in range(self.N_super):
-            h, c, p_emb = self.get_front(x_in, t_in)
+            h, c, p_emb = denoiser.get_front(x_in, t_in)
             z_H, z_L, q_values, memory, importance_scores = denoiser.roll(h, c, p_emb, z_H, z_L, memory=None)
-
-            xt, t, is_masked = loss_fn.perturb(x0, answer_mask=answer_mask)
 
             losses = {}
             # Fresh perturbation each segment -- different t, different masks
             xt, t, is_masked = loss_fn.perturb(x0, answer_mask=answer_mask)
-            h, importance_scores2 = denoiser.get_front(xt, t, memory)
-            logits = denoiser.out_proj(h)
+            h2, importance_scores2 = denoiser.get_hidden(xt, t, memory)
+            logits = denoiser.out_proj(h2)
             losses["LM"] = loss_fn(logits, x0, is_masked)
 
             # ACT halt loss -- soft accuracy on masked positions
@@ -463,15 +460,15 @@ class PonderTrainer:
             mem_loss_fn = MemoryLoss()
             losses["mem"] = mem_loss_fn(importance_scores) + mem_loss_fn(importance_scores2)
 
-            losses["rep"] = repulsion_loss(z_H_new)
+            losses["rep"] = repulsion_loss(z_H)
 
             # Expensive losses only on last segment
             is_last = (seg == self.N_super - 1)
             if is_last:
                 block = denoiser.ponder.block
-                losses["equil"] = equilibrium_loss(z_H_new, z_L_new, block, c, p_emb)
+                losses["equil"] = equilibrium_loss(z_H, z_L, block, c, p_emb)
                 losses["RH_stable"] = routh_hurwitz_stable_loss(
-                    z_H_new + z_L_new, block, c, p_emb)
+                    z_H + z_L, block, c, p_emb)
             else:
                 losses["equil"] = torch.tensor(0.0, device=device)
                 losses["RH_stable"] = torch.tensor(0.0, device=device)
@@ -488,8 +485,8 @@ class PonderTrainer:
             total.backward()
 
             # Detach latent states for next segment (deep supervision)
-            z_H = z_H_new.detach()
-            z_L = z_L_new.detach()
+            z_H = z_H.detach()
+            z_L = z_L.detach()
             memory = memory.detach()
 
             for k, v in losses.items():
