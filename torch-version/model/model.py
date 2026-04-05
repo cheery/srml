@@ -69,8 +69,8 @@ class SRLMEnergyModel(EnergyModelBase):
         self.denoiser.load_state_dict(denoiser.state_dict())
 
     def forward(self, x0, t, memory=None):
-        _, h, memory, importance_scores = self.denoiser.get_hidden(None, x0, t, memory)
-        return self.outlet(h), memory, importance_scores
+        h, importance_scores = self.denoiser.get_hidden(x0, t, memory)
+        return self.outlet(h)
 
 class SRLMDenoiser(nn.Module):
     def __init__(self, cfg: SRLMConfig):
@@ -84,21 +84,25 @@ class SRLMDenoiser(nn.Module):
             init_layer(cfg)
             for _ in range(cfg.front_layers)
         ])
+        self.latent_memory_in = LatentMemoryIn(
+                cfg.hidden_dim,
+                cfg.gmem_memory_dim,
+                cfg.num_heads)
         self.latent_memory = LatentMemoryBank(
                     cfg.hidden_dim,
                     cfg.gmem.memory_dim,
                     cfg.num_heads)
-        #self.ponder = PonderBlock(
-        #    cfg.hidden_dim,
-        #    cfg.max_context_length,
-        #    num_heads=cfg.num_heads,
-        #    N_H=cfg.ponder.N_H,
-        #    N_L=cfg.ponder.N_L,
-        #    noise_sigma=cfg.ponder.noise_sigma,
-        #    noise_type=cfg.ponder.noise_type,
-        #    use_attention=cfg.ponder.use_attention,
-        #    use_stablemax=cfg.ponder.use_stablemax,
-        #)
+        self.ponder = PonderBlock(
+            cfg.hidden_dim,
+            cfg.max_context_length,
+            num_heads=cfg.num_heads,
+            N_H=cfg.ponder.N_H,
+            N_L=cfg.ponder.N_L,
+            noise_sigma=cfg.ponder.noise_sigma,
+            noise_type=cfg.ponder.noise_type,
+            use_attention=cfg.ponder.use_attention,
+            use_stablemax=cfg.ponder.use_stablemax,
+        )
         self.back_layers = nn.ModuleList([
             init_layer(cfg)
             for _ in range(cfg.back_layers)
@@ -106,6 +110,13 @@ class SRLMDenoiser(nn.Module):
         self.out_proj = nn.Linear(cfg.hidden_dim, cfg.vocab_size)
         nn.init.zeros_(self.out_proj.weight)
         nn.init.constant_(self.out_proj.bias, -6.0)
+
+    def get_front(self, xt, t):
+        h, c, p_emb = self.input(xt, t)
+        for layer in self.front_layers:
+            h = layer(h, c, p_emb)
+            h += torch.randn_like(h) * 0.01
+        return h, c, p_emb
 
     def init_memory(self, batch_size, device):
         """Create zero-initialized memory state."""
@@ -117,15 +128,27 @@ class SRLMDenoiser(nn.Module):
         z_L = torch.zeros_like(h)
         return z_H, z_L
 
-    def get_front(self, xt, t, memory=None):
-        h, c, p_emb = self.input(xt, t)
-        for layer in self.front_layers:
-            h = layer(h, c, p_emb)
-            h += torch.randn_like(h) * 0.01
+    def roll(self, h, c, p_emb, z_H, z_L, memory=None):
+        z_H, z_L, q_values = self.ponder(h, c, p_emb, z_H, z_L)
         if memory is None:
             memory = self.init_memory(h.shape[0], h.device)
-        h, memory, importance_scores = self.latent_memory(h, memory)
-        return h, c, p_emb, memory, importance_scores
+        z_H, memory, importance_scores = self.latent_memory(z_H, memory)
+        return z_H, z_L, q_values, memory, importance_scores
+
+    def init_t(self, xt):
+        return torch.ones((xt.shape[0],), device=xt.device) * 2.0 # TODO: consider whether 1.0 should go here.
+
+    def pioneer(self, xt, t=None, memory=None):
+        if t is None:
+            t = self.init_t(xt)
+        h, c, p_emb = self.get_front(xt, t)
+        z_H, z_L = self.init_states(h)
+        for _ in range(self.cfg.ponder.N_super):
+            z_H, z_L, q_values, memory, importance_scores = self.roll(h, c, p_emb, z_H, z_L, memory=None)
+            q_mean = q_values.mean(0)
+            if q_mean[0] > q_mean[1]:
+                return memory
+        return memory
 
     def get_back(self, h, c, p_emb):
         for layer in self.back_layers:
@@ -137,28 +160,17 @@ class SRLMDenoiser(nn.Module):
         h = self.get_back(h, c, p_emb)
         return self.out_proj(h)
 
-    def middle(self, h, c, p_emb, z_H, z_L):
-        with torch.no_grad():
-            for _ in range(1, self.cfg.ponder.N_super):
-                z_H, z_L, q_values = self.ponder(h, c, p_emb, z_H, z_L)
-                #if not self.training:
-                q_mean = q_values.mean(0)
-                if q_mean[0] > q_mean[1]:
-                     return z_H, z_L
-        z_H, z_L, q_values = self.ponder(h, c, p_emb, z_H, z_L)
-        return z_H, z_L
-
     def get_hidden(self, z, xt, t, memory=None):
-        h, c, p_emb, memory, importance_scores = self.get_front(xt, t, memory)
-        z_H, z_L = self.init_states(h) if z is None else z
-        #z_H, z_L = self.middle(h, c, p_emb, z_H, z_L)
-        #h = self.get_back(z_H, c, p_emb)
+        h, c, p_emb = self.get_front(xt, t)
+        if memory is None:
+            memory = self.init_memory(h.shape[0], h.device)
+        h, importance_scores = self.latent_memory_in(h, memory)
         h = self.get_back(h, c, p_emb)
-        return (z_H, z_L), h, memory, importance_scores
+        return h, importance_scores
 
-    def forward(self, z, xt, t, memory=None):
-        z, h, memory, importance_scores = self.get_hidden(z, xt, t, memory)
-        return z, self.out_proj(h), memory, importance_scores
+    def forward(self, xt, t, memory=None):
+        h, importance_scores = self.get_hidden(xt, t, memory)
+        return self.out_proj(h)
 
 def init_layer(cfg):
     return Block(cfg.hidden_dim, cfg.num_heads, cfg.mlp_ratio, cfg.dropout)
@@ -257,7 +269,8 @@ def mdlm_loss(denoiser, x0, schedule, memory=None,
     mask_id = denoiser.cfg.vocab_size
     loss_fn = MDLMLoss(schedule, mask_id, t_min=t_min)
     xt, t, is_masked = loss_fn.perturb(x0, answer_mask=answer_mask)
-    _, logits, memory, importance_scores = denoiser(None, xt, t, memory)
+    h, importance_scores = denoiser.get_hidden(xt, t, memory)
+    logits = denoiser.out_proj(h)
     loss = loss_fn(logits, x0, is_masked)
     return loss, memory, importance_scores
 
@@ -279,12 +292,12 @@ def nce_loss(energy_model, denoiser, x0, schedule,
 
     # Negative sample from frozen denoiser
     with torch.no_grad():
-        _, logits, memory, importance_scores = denoiser(None, xt, t, memory)
+        logits = denoiser(xt, t, memory)
     x_neg = loss_fn.sample_neg(x0, logits, is_masked)
 
     # Energies -- positive (true x0) and negative (denoiser sample)
-    e_pos, _, _ = energy_model(x0, t, memory)
-    e_neg, _, _ = energy_model(x_neg, t, memory)
+    e_pos = energy_model(x0, t, memory)
+    e_neg = energy_model(x_neg, t, memory)
 
     loss = loss_fn(e_pos, e_neg)
     return loss, memory, importance_scores
@@ -331,7 +344,7 @@ def sample(denoiser, schedule, batch_size, seq_len, num_steps=256,
                                  .reshape(k * batch_size, *memory.shape[1:])
             else:
                 mem_flat = None
-            energies, _, _ = energy_model(c_flat, t_flat, mem_flat)
+            energies = energy_model(c_flat, t_flat, mem_flat)
             energies = energies.reshape(k, batch_size)
             x0 = s.select_by_energy(candidates, energies)
         else:
@@ -379,7 +392,6 @@ class PonderTrainer:
         optimizer: torch.optim.Optimizer,
         memory: Optional[torch.Tensor] = None,
         answer_mask: Optional[torch.Tensor] = None,
-        ponder_x0: Optional[torch.Tensor] = None,
         w: Optional[torch.Tensor] = None,
         t_min: float = 1e-4,
     ) -> tuple[dict[str, float], torch.Tensor]:
@@ -398,15 +410,8 @@ class PonderTrainer:
             memory:  updated memory state (detached)
         """
         denoiser = self.denoiser
-        denoiser.train()
         mask_id = denoiser.cfg.vocab_size
         device = x0.device
-
-        if memory is None:
-            memory = denoiser.init_memory(x0.shape[0], device)
-
-        # What ponder sees: question only (if provided) or full x0
-        ponder_input = ponder_x0 if ponder_x0 is not None else x0
 
         loss_fn = MDLMLoss(self.schedule, mask_id, t_min=t_min)
 
@@ -418,34 +423,28 @@ class PonderTrainer:
         else:
             min_seg = self.M_min
 
-        # front once: embed ponder_input, read from memory
-        t = torch.zeros(ponder_input.shape[0], device=ponder_input.device)
-        _, _, memory, _ = denoiser(None, ponder_input, t, memory)
+        x_in = x0.clone()
+        x_in[answer_mask] = mask_id
+        t_in = self.init_t(x_in)
+        h, c, p_emb = self.get_front(x_in, t_in)
+        z_H, z_L = self.init_states(h)
         
-        xt, t, is_masked = loss_fn.perturb(x0, answer_mask=answer_mask)
-        h, c, p_emb, memory, importance_scores = denoiser.get_front(xt, t, memory)
-        z_H, z_L = denoiser.init_states(h)
-
         all_losses = {k: 0.0 for k in [
             "LM", "BCE", "mem", "rep", "equil", "RH_stable", "total"
         ]}
 
         for seg in range(self.N_super):
-            # Fresh perturbation each segment -- different t, different masks
+            h, c, p_emb = self.get_front(x_in, t_in)
+            z_H, z_L, q_values, memory, importance_scores = denoiser.roll(h, c, p_emb, z_H, z_L, memory=None)
+
             xt, t, is_masked = loss_fn.perturb(x0, answer_mask=answer_mask)
 
-            # PonderBlock iteration — front layers see perturbed input
-            h, c, p_emb, memory, importance_scores = denoiser.get_front(xt, t, memory)
-            z_H_new, z_L_new, q_values = denoiser.ponder(h, c, p_emb, z_H, z_L)
-
-            logits = denoiser.get_behind(z_H_new, c, p_emb)
-
-            # --- Losses ---
             losses = {}
-            per_sample = loss_fn.per_sample(logits, x0, is_masked)
-            if w is not None:
-                per_sample = per_sample * w
-            losses["LM"] = per_sample.mean()
+            # Fresh perturbation each segment -- different t, different masks
+            xt, t, is_masked = loss_fn.perturb(x0, answer_mask=answer_mask)
+            h, importance_scores2 = denoiser.get_front(xt, t, memory)
+            logits = denoiser.out_proj(h)
+            losses["LM"] = loss_fn(logits, x0, is_masked)
 
             # ACT halt loss -- soft accuracy on masked positions
             # (TRM-style: halt BCE only, no continue target)
@@ -462,7 +461,7 @@ class PonderTrainer:
 
             # Memory regularization
             mem_loss_fn = MemoryLoss()
-            losses["mem"] = mem_loss_fn(importance_scores)
+            losses["mem"] = mem_loss_fn(importance_scores) + mem_loss_fn(importance_scores2)
 
             losses["rep"] = repulsion_loss(z_H_new)
 
@@ -512,9 +511,10 @@ class PonderTrainer:
             if p.grad is not None:
                 p.grad /= n_run
 
-        torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
-        optimizer.step()
-        optimizer.zero_grad()
+        # Have the callee call these and denoiser.train(), more diverse usecases this way.
+        #torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
+        #optimizer.step()
+        #optimizer.zero_grad()
 
         memory = memory.detach()
         return {k: v / n_run for k, v in all_losses.items()}, memory

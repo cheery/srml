@@ -568,19 +568,12 @@ def grpo_step(
         print()
     debug()
 
-    # --- 3. RKL policy gradient with single-step ratios ---
-    # Subsample trajectory steps to keep gradient strong.
-    # Training on all N steps then dividing by N kills the signal.
-    import random
-    steps_to_train = trajectory #random.sample(trajectory, min(train_steps, len(trajectory)))
-
-    #denoiser.train()
+    # --- 3. RKL policy gradient ---
     full_loss = 0.0
-
     for epoch in range(epochs):
         total_loss = torch.tensor(0.0, device=device)
 
-        for step_data in reversed(steps_to_train):
+        for step_data in reversed(trajectory):
             optimizer.zero_grad()
             xt_s       = step_data["xt"]
             x0_s       = step_data["x0"]
@@ -626,4 +619,4 @@ def grpo_step(
         'mean_reward': rewards.mean().item(),
         'frac_correct': (rewards > -0.5).float().mean().item(),
     }
-    return full_loss / max(len(steps_to_train), 1), None, metrics
+    return full_loss / max(len(trajectory), 1), None, metrics
