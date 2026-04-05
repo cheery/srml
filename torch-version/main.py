@@ -48,13 +48,18 @@ PARQUET_FILES = [
 ]
 
 DEFAULT_CONFIG = SRLMConfig(
-    gmem   = GMemConfig(memory_dim=128, num_slots=64),
-    ponder = PonderConfig(N_H=3, N_L=6),
+    gmem   = GMemConfig(memory_dim=384, num_slots=64),
+    ponder = PonderConfig(N_H=2, N_L=4),
+    hidden_dim = 384,
+    num_heads = 12,
+    front_layers = 3,
+    back_layers = 3,
+
 )
 
 MEDIUM_CONFIG = SRLMConfig(
     gmem              = GMemConfig(memory_dim=384, num_slots=1024),
-    ponder            = PonderConfig(N_H=3, N_L=6),
+    ponder            = PonderConfig(N_H=2, N_L=4),
     hidden_dim        = 384,
     num_heads         = 12,
     front_layers      = 3,
@@ -64,7 +69,7 @@ MEDIUM_CONFIG = SRLMConfig(
 
 LARGE_CONFIG = SRLMConfig(
     gmem              = GMemConfig(memory_dim=512, num_slots=2048),
-    ponder            = PonderConfig(N_H=3, N_L=6),
+    ponder            = PonderConfig(N_H=2, N_L=4),
     hidden_dim        = 768,
     num_heads         = 12,
     mlp_ratio         = 4,
@@ -302,6 +307,7 @@ class ArithmeticProgram:
         for i in range(self.batch_size):
             n = torch.randint(0, self.max_operand + 1, ()).item()
             m = torch.randint(0, self.max_operand + 1, ()).item()
+            #n,m = 1,20
             prompt = f"{n}+{m}="
             answer = f"{n+m}"
             full = prompt + answer
@@ -483,11 +489,18 @@ def cmd_train(args):
     print("Initialising model...")
     denoiser = SRLMDenoiser(config).to(device)
     load_checkpoint(denoiser, ckpt_path)
+
+    ref_denoiser = SRLMDenoiser(config).to(device)
+    load_checkpoint(ref_denoiser, ckpt_path)
+    ref_denoiser.eval()
+    for p in ref_denoiser.parameters():
+        p.requires_grad_(False)
     print(f"Denoiser params:  {param_count(denoiser):,}")
     print(f"Denoiser memory:  {param_memory_mb(denoiser):.1f} MB")
 
     # Optimizer covers both denoiser and ponder
     optimizer = optim.AdamW(denoiser.parameters(), lr=args.lr, weight_decay=0.01)
+    grpo_optimizer = optim.AdamW(denoiser.parameters(), lr=1e-6)#, weight_decay=0.01)
     ema = EMA(denoiser, mu=0.999)
     mem_loss_fn = MemoryLoss()
 
@@ -610,7 +623,7 @@ def cmd_train(args):
             if ponder_x0 is not None:
                 ponder_x0 = ponder_x0.to(device)
 
-            is_reasoning = isinstance(program, (SudokuProgram, ArithmeticProgram, QAProgram))
+            is_reasoning = False # isinstance(program, (SudokuProgram, ArithmeticProgram, QAProgram))
 
             # Determine if this is a study or practice step
             if use_memory and memory_alternate > 0:
@@ -620,13 +633,53 @@ def cmd_train(args):
 
             ponder_info = ""
 
-            if is_reasoning:
+            # --- GRPO reinforcement (always) ---
+            if args.grpo_every == 1:
+                if isinstance(program, ArithmeticProgram):
+                    reward_fn = arithmetic_reward
+                else:
+                    reward_fn = sudoku_reward
+                # Build prompt: mask answer positions
+                prompt = x0.clone()
+                if answer_mask is not None:
+                    prompt[answer_mask] = MASK_TOKEN
+                grpo_loss, memory, grpo_metrics = grpo_step(
+                        denoiser,
+                        ref_denoiser,
+                        grpo_optimizer, schedule,
+                        prompt_batch=prompt,
+                        clean_batch=x0,
+                        reward_fn=reward_fn,
+                        device=device,
+                        memory=memory)
+                        
+                #grpo_loss, memory, grpo_metrics = grpo_step(
+                #    denoiser, grpo_optimizer, schedule,
+                #    prompt_batch=prompt,
+                #    clean_batch=x0,
+                #    reward_fn=reward_fn,
+                #    device=device,
+                #    memory=memory,
+                #    answer_mask=answer_mask,
+                #    K=args.grpo_k,
+                #    sampling_steps=args.grpo_steps,
+                #    beta_dgpo=args.grpo_beta,
+                #    #clip_range=args.grpo_clip,
+                #    verbose=(global_step % args.report_every == 0),
+                #)
+                ema.update(denoiser)
+                avg_loss = grpo_loss
+                ponder_info += (f" | grpo={grpo_loss:.4f}"
+                                f" r={grpo_metrics['mean_reward']:.3f}")
+
+            elif is_reasoning:
                 # --- Reasoning tasks: always use ponder deep supervision ---
                 # For QA: ponder sees question only, denoiser denoises answer
                 ponder_losses, memory = ponder_trainer.train_step(
                     x0, optimizer, memory, answer_mask=answer_mask,
                     ponder_x0=ponder_x0,
                 )
+                scheduler.step()
                 ema.update(denoiser)
                 avg_loss = ponder_losses['LM']
                 ponder_info = (f" | ponder LM={ponder_losses['LM']:.4f}"
@@ -649,7 +702,9 @@ def cmd_train(args):
                     if answer_mask is not None:
                         prompt[answer_mask] = MASK_TOKEN
                     grpo_loss, memory, grpo_metrics = grpo_step(
-                        denoiser, optimizer, schedule,
+                        denoiser,
+                        ref_denoiser,
+                        grpo_optimizer, schedule,
                         prompt_batch=prompt,
                         clean_batch=x0,
                         reward_fn=reward_fn,
@@ -658,6 +713,8 @@ def cmd_train(args):
                         answer_mask=answer_mask,
                         K=args.grpo_k,
                         sampling_steps=args.grpo_steps,
+                        beta_dgpo=args.grpo_beta,
+                        #clip_range=args.grpo_clip,
                         verbose=(global_step % args.report_every == 0),
                     )
                     ema.update(denoiser)
@@ -677,6 +734,7 @@ def cmd_train(args):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
                 optimizer.step()
+                scheduler.step()
                 ema.update(denoiser)
 
                 if memory is not None:
@@ -694,6 +752,7 @@ def cmd_train(args):
                         x0, optimizer, memory, answer_mask=answer_mask,
                     )
                     ponder_info = f" | ponder LM={ponder_losses['LM']:.4f}"
+                    scheduler.step()
 
             # --- Practice phase: replay old data with stored memory context ---
             else:
@@ -709,6 +768,7 @@ def cmd_train(args):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
                 optimizer.step()
+                scheduler.step()
                 ema.update(denoiser)
 
                 if memory is not None:
@@ -757,6 +817,9 @@ def cmd_train(args):
                 log = "\n".join(training_log_lines)
                 log += f"\nsaved at step {global_step}"
                 save_checkpoint(ckpt_path, denoiser, config, log, wiki_state, ema=ema)
+                # Update reference model for GRPO (paper Algorithm 1, line 3)
+                ref_denoiser.load_state_dict(denoiser.state_dict())
+                ref_denoiser.eval()
 
             if global_step % args.sample_every == 0:
                 denoiser.eval()
@@ -767,7 +830,6 @@ def cmd_train(args):
                     print(f"    sample {i+1}: {repr(as_text(s[i][:80]))}")
                 ema.restore(denoiser)
 
-            scheduler.step()
             program_idx = (program_idx + 1) % len(programs)
 
     except KeyboardInterrupt:
@@ -1028,6 +1090,10 @@ def main():
                          help="GRPO candidates per prompt (default: 4)")
     p_train.add_argument("--grpo-steps", type=int, default=32, dest="grpo_steps",
                          help="GRPO sampling steps (default: 32)")
+    p_train.add_argument("--grpo-clip", type=float, default=0.05, dest="grpo_clip",
+                         help="GRPO PPO-style clip range (default: 0.05, 0=disabled)")
+    p_train.add_argument("--grpo-beta", type=float, default=100.0, dest="grpo_beta",
+                         help="DGPO sigmoid temperature (default: 100)")
     # Program interleaving
     p_train.add_argument("--interleave", type=int, default=0,
                          help="Switch programs every N steps (0=sequential)")

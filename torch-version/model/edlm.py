@@ -336,6 +336,14 @@ class MDLMLoss:
             logits.transpose(1, 2), x0.long(), reduction='none')  # (B, L)
         return (ce * is_masked.float()).sum() / n_masked
 
+    def per_sample(self, logits, x0, is_masked):
+        """Per-sample mean CE over masked positions. Returns (B,) tensor."""
+        ce = F.cross_entropy(
+            logits.transpose(1, 2), x0.long(), reduction='none')  # (B, L)
+        masked_ce = ce * is_masked.float()                         # (B, L)
+        n_per = is_masked.float().sum(dim=1).clamp(min=1)          # (B,)
+        return masked_ce.sum(dim=1) / n_per                        # (B,)
+
     @classmethod
     def _example_of_use(cls, denoiser, x0):
         mdlm_loss = cls(schedule, denoiser.mask_id, t_min=1e-4)

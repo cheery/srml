@@ -88,17 +88,17 @@ class SRLMDenoiser(nn.Module):
                     cfg.hidden_dim,
                     cfg.gmem.memory_dim,
                     cfg.num_heads)
-        self.ponder = PonderBlock(
-            cfg.hidden_dim,
-            cfg.max_context_length,
-            num_heads=cfg.num_heads,
-            N_H=cfg.ponder.N_H,
-            N_L=cfg.ponder.N_L,
-            noise_sigma=cfg.ponder.noise_sigma,
-            noise_type=cfg.ponder.noise_type,
-            use_attention=cfg.ponder.use_attention,
-            use_stablemax=cfg.ponder.use_stablemax,
-        )
+        #self.ponder = PonderBlock(
+        #    cfg.hidden_dim,
+        #    cfg.max_context_length,
+        #    num_heads=cfg.num_heads,
+        #    N_H=cfg.ponder.N_H,
+        #    N_L=cfg.ponder.N_L,
+        #    noise_sigma=cfg.ponder.noise_sigma,
+        #    noise_type=cfg.ponder.noise_type,
+        #    use_attention=cfg.ponder.use_attention,
+        #    use_stablemax=cfg.ponder.use_stablemax,
+        #)
         self.back_layers = nn.ModuleList([
             init_layer(cfg)
             for _ in range(cfg.back_layers)
@@ -121,6 +121,7 @@ class SRLMDenoiser(nn.Module):
         h, c, p_emb = self.input(xt, t)
         for layer in self.front_layers:
             h = layer(h, c, p_emb)
+            h += torch.randn_like(h) * 0.01
         if memory is None:
             memory = self.init_memory(h.shape[0], h.device)
         h, memory, importance_scores = self.latent_memory(h, memory)
@@ -129,24 +130,30 @@ class SRLMDenoiser(nn.Module):
     def get_back(self, h, c, p_emb):
         for layer in self.back_layers:
             h = layer(h, c, p_emb)
+            h += torch.randn_like(h) * 0.01
         return h
 
     def get_behind(self, h, c, p_emb):
         h = self.get_back(h, c, p_emb)
         return self.out_proj(h)
 
-    def get_hidden(self, z, xt, t, memory=None):
-        h, c, p_emb, memory, importance_scores = self.get_front(xt, t, memory)
-        z_H, z_L = self.init_states(h) if z is None else z
+    def middle(self, h, c, p_emb, z_H, z_L):
         with torch.no_grad():
             for _ in range(1, self.cfg.ponder.N_super):
                 z_H, z_L, q_values = self.ponder(h, c, p_emb, z_H, z_L)
-                if not self.training:
-                    q_mean = q_values.mean(0)
-                    if q_mean[0] > q_mean[1]:
-                        break
+                #if not self.training:
+                q_mean = q_values.mean(0)
+                if q_mean[0] > q_mean[1]:
+                     return z_H, z_L
         z_H, z_L, q_values = self.ponder(h, c, p_emb, z_H, z_L)
-        h = self.get_back(z_H, c, p_emb)
+        return z_H, z_L
+
+    def get_hidden(self, z, xt, t, memory=None):
+        h, c, p_emb, memory, importance_scores = self.get_front(xt, t, memory)
+        z_H, z_L = self.init_states(h) if z is None else z
+        #z_H, z_L = self.middle(h, c, p_emb, z_H, z_L)
+        #h = self.get_back(z_H, c, p_emb)
+        h = self.get_back(h, c, p_emb)
         return (z_H, z_L), h, memory, importance_scores
 
     def forward(self, z, xt, t, memory=None):
@@ -373,6 +380,7 @@ class PonderTrainer:
         memory: Optional[torch.Tensor] = None,
         answer_mask: Optional[torch.Tensor] = None,
         ponder_x0: Optional[torch.Tensor] = None,
+        w: Optional[torch.Tensor] = None,
         t_min: float = 1e-4,
     ) -> tuple[dict[str, float], torch.Tensor]:
         """
@@ -434,7 +442,10 @@ class PonderTrainer:
 
             # --- Losses ---
             losses = {}
-            losses["LM"] = loss_fn(logits, x0, is_masked)
+            per_sample = loss_fn.per_sample(logits, x0, is_masked)
+            if w is not None:
+                per_sample = per_sample * w
+            losses["LM"] = per_sample.mean()
 
             # ACT halt loss -- soft accuracy on masked positions
             # (TRM-style: halt BCE only, no continue target)
