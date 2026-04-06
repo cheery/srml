@@ -388,26 +388,29 @@ class PonderTrainer:
     def train_step(
         self,
         x0: torch.Tensor,
-        optimizer: torch.optim.Optimizer,
         memory: Optional[torch.Tensor] = None,
         answer_mask: Optional[torch.Tensor] = None,
-        w: Optional[torch.Tensor] = None,
         t_min: float = 1e-4,
     ) -> tuple[dict[str, float], torch.Tensor]:
         """
         Args:
-            x0:        clean tokens (denoiser target, answer included)
-            optimizer: shared optimizer for ponder + denoiser
-            memory:    G-Mem state or None
+            x0:          clean tokens (denoiser target, answer included)
+            memory:      G-Mem state or None
             answer_mask: (B, L) bool -- True at answer positions to noise
-            ponder_x0: separate clean tokens for ponder (e.g. question only).
-                       If None, ponder sees x0.
-            t_min:     minimum diffusion time
+            t_min:       minimum diffusion time
 
         Returns:
             losses:  dict of loss values for logging
             memory:  updated memory state (detached)
         """
+        state = self.init_train_state(x0, memory, answer_mask, t_min)
+        for seg in range(self.N_super):
+            state.roll()
+            if state.compute_losses(seg):
+                break
+        return state.finish()
+
+    def init_train_state(self, x0, memory, answer_mask, t_min):
         denoiser = self.denoiser
         mask_id = denoiser.cfg.vocab_size
         device = x0.device
@@ -427,91 +430,151 @@ class PonderTrainer:
         t_in = denoiser.init_t(x_in)
         h, c, p_emb = denoiser.get_front(x_in, t_in)
         z_H, z_L = denoiser.init_states(h)
-        
-        all_losses = {k: 0.0 for k in [
-            "LM", "BCE", "mem", "rep", "equil", "RH_stable", "total"
-        ]}
 
-        for seg in range(self.N_super):
-            h, c, p_emb = denoiser.get_front(x_in, t_in)
-            z_H, z_L, q_values, memory, importance_scores = denoiser.roll(h, c, p_emb, z_H, z_L, memory=None)
+        return PonderTrainerState(
+            trainer=self,
+            loss_fn=loss_fn,
+            min_seg=min_seg,
+            x0=x0,
+            x_in=x_in,
+            t_in=t_in,
+            answer_mask=answer_mask,
+            memory=memory,
+            z_H=z_H,
+            z_L=z_L,
+            seg=0,
+            all_losses={k: 0.0 for k in [
+                "LM", "BCE", "mem", "rep", "equil", "RH_stable", "total"
+            ]},
+        )
 
-            losses = {}
-            # Fresh perturbation each segment -- different t, different masks
-            xt, t, is_masked = loss_fn.perturb(x0, answer_mask=answer_mask)
-            h2, importance_scores2 = denoiser.get_hidden(xt, t, memory)
-            logits = denoiser.out_proj(h2)
-            losses["LM"] = loss_fn(logits, x0, is_masked)
+class PonderTrainerState:
+    def __init__(self, trainer, loss_fn, min_seg,
+                 x0, x_in, t_in, answer_mask, memory,
+                 z_H, z_L, seg, all_losses):
+        self.trainer = trainer
+        self.loss_fn = loss_fn
+        self.min_seg = min_seg
+        self.x0 = x0
+        self.x_in = x_in
+        self.t_in = t_in
+        self.answer_mask = answer_mask
+        self.memory = memory
+        self.z_H = z_H
+        self.z_L = z_L
+        self.seg = seg
+        self.all_losses = all_losses
+        # Set after roll()
+        self.q_values = None
+        self.importance_scores = None
+        self.importance_scores2 = None
+        self.c = None
+        self.p_emb = None
+        # Set before compute_common_losses (by compute_losses or externally)
+        self.logits = None
+        self.is_masked = None
 
-            # ACT halt loss -- soft accuracy on masked positions
-            # (TRM-style: halt BCE only, no continue target)
-            with torch.no_grad():
-                token_correct = (logits.argmax(-1) == x0).float()
-                if is_masked.any():
-                    masked_correct = (token_correct * is_masked.float()).sum(-1)
-                    masked_count = is_masked.float().sum(-1).clamp(min=1)
-                    accuracy = masked_correct / masked_count
-                else:
-                    accuracy = token_correct.mean(-1)
-            target = torch.stack([accuracy, 1.0 - accuracy], dim=-1)
-            losses["BCE"] = F.binary_cross_entropy(q_values, target)
+    def roll(self):
+        denoiser = self.trainer.denoiser
+        h, c, p_emb = denoiser.get_front(self.x_in, self.t_in)
+        self.z_H, self.z_L, self.q_values, self.memory, self.importance_scores = \
+            denoiser.roll(h, c, p_emb, self.z_H, self.z_L, self.memory)
+        self.c = c
+        self.p_emb = p_emb
 
-            # Memory regularization
-            mem_loss_fn = MemoryLoss()
-            losses["mem"] = mem_loss_fn(importance_scores) + mem_loss_fn(importance_scores2)
+    def compute_losses(self, seg):
+        trainer = self.trainer
+        denoiser = trainer.denoiser
 
-            losses["rep"] = repulsion_loss(z_H)
+        # Fresh perturbation each segment -- different t, different masks
+        xt, t, is_masked = self.loss_fn.perturb(self.x0, answer_mask=self.answer_mask)
+        h2, importance_scores2 = denoiser.get_hidden(xt, t, self.memory)
+        logits = denoiser.out_proj(h2)
+        lm_loss = self.loss_fn(logits, self.x0, is_masked)
 
-            # Expensive losses only on last segment
-            is_last = (seg == self.N_super - 1)
-            if is_last:
-                block = denoiser.ponder.block
-                losses["equil"] = equilibrium_loss(z_H, z_L, block, c, p_emb)
-                losses["RH_stable"] = routh_hurwitz_stable_loss(
-                    z_H + z_L, block, c, p_emb)
+        # Store for compute_common_losses (BCE needs logits + is_masked)
+        self.logits = logits
+        self.is_masked = is_masked
+        self.importance_scores2 = importance_scores2
+
+        return self.compute_common_losses(seg, lm_loss)
+
+    def compute_common_losses(self, seg, lm_loss):
+        trainer = self.trainer
+        denoiser = trainer.denoiser
+        device = self.x0.device
+
+        losses = {}
+        losses["LM"] = lm_loss
+
+        # ACT halt loss -- soft accuracy on masked positions
+        with torch.no_grad():
+            token_correct = (self.logits.argmax(-1) == self.x0).float()
+            if self.is_masked.any():
+                masked_correct = (token_correct * self.is_masked.float()).sum(-1)
+                masked_count = self.is_masked.float().sum(-1).clamp(min=1)
+                accuracy = masked_correct / masked_count
             else:
-                losses["equil"] = torch.tensor(0.0, device=device)
-                losses["RH_stable"] = torch.tensor(0.0, device=device)
+                accuracy = token_correct.mean(-1)
+        target = torch.stack([accuracy, 1.0 - accuracy], dim=-1)
+        losses["BCE"] = F.binary_cross_entropy(self.q_values, target)
 
-            total = (
-                self.lambda_LM * losses["LM"]
-                + self.lambda_BCE * losses["BCE"]
-                + self.lambda_mem * losses["mem"]
-                + self.lambda_rep * losses["rep"]
-                + self.lambda_equil * losses["equil"]
-                + self.lambda_RH_stable * losses["RH_stable"]
-            )
+        # Memory regularization
+        mem_loss_fn = MemoryLoss()
+        mem_loss = mem_loss_fn(self.importance_scores)
+        if self.importance_scores2 is not None:
+            mem_loss = mem_loss + mem_loss_fn(self.importance_scores2)
+        losses["mem"] = mem_loss
 
-            total.backward()
+        losses["rep"] = repulsion_loss(self.z_H)
 
-            # Detach latent states for next segment (deep supervision)
-            z_H = z_H.detach()
-            z_L = z_L.detach()
-            memory = memory.detach()
+        # Expensive losses only on last segment
+        is_last = (seg == trainer.N_super - 1)
+        if is_last:
+            block = denoiser.ponder.block
+            losses["equil"] = equilibrium_loss(self.z_H, self.z_L, block, self.c, self.p_emb)
+            losses["RH_stable"] = routh_hurwitz_stable_loss(
+                self.z_H + self.z_L, block, self.c, self.p_emb)
+        else:
+            losses["equil"] = torch.tensor(0.0, device=device)
+            losses["RH_stable"] = torch.tensor(0.0, device=device)
 
-            for k, v in losses.items():
-                all_losses[k] += v.item()
-            all_losses["total"] += total.item()
+        total = (
+            trainer.lambda_LM * losses["LM"]
+            + trainer.lambda_BCE * losses["BCE"]
+            + trainer.lambda_mem * losses["mem"]
+            + trainer.lambda_rep * losses["rep"]
+            + trainer.lambda_equil * losses["equil"]
+            + trainer.lambda_RH_stable * losses["RH_stable"]
+        )
 
-            # ACT early stopping: halt when Q_halt > Q_continue
-            # after running at least min_seg segments
-            if seg >= min_seg - 1:
-                with torch.no_grad():
-                    q_mean = q_values.mean(0)
-                    if q_mean[0] > q_mean[1]:
-                        break
+        total.backward()
 
-        # Scale all gradients by 1/n_run so effective LR is independent
-        # of how many segments actually ran (all params accumulate from N segments)
-        n_run = seg + 1
+        # Detach latent states for next segment (deep supervision)
+        self.z_H = self.z_H.detach()
+        self.z_L = self.z_L.detach()
+        self.memory = self.memory.detach()
+        self.seg = seg
+
+        for k, v in losses.items():
+            self.all_losses[k] += v.item()
+        self.all_losses["total"] += total.item()
+
+        # ACT early stopping: halt when Q_halt > Q_continue
+        # after running at least min_seg segments
+        if seg >= self.min_seg - 1:
+            with torch.no_grad():
+                q_mean = self.q_values.mean(0)
+                if q_mean[0] > q_mean[1]:
+                    return True
+        return False
+
+    def finish(self):
+        denoiser = self.trainer.denoiser
+        n_run = self.seg + 1
         for p in denoiser.parameters():
             if p.grad is not None:
                 p.grad /= n_run
 
-        # Have the callee call these and denoiser.train(), more diverse usecases this way.
-        #torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
-        #optimizer.step()
-        #optimizer.zero_grad()
-
-        memory = memory.detach()
-        return {k: v / n_run for k, v in all_losses.items()}, memory
+        memory = self.memory.detach()
+        return {k: v / n_run for k, v in self.all_losses.items()}, memory

@@ -677,7 +677,7 @@ def cmd_train(args):
                 denoiser.train()
                 optimizer.zero_grad()
                 ponder_losses, memory = ponder_trainer.train_step(
-                    x0, optimizer, memory, answer_mask=answer_mask,
+                    x0, memory=memory, answer_mask=answer_mask,
                 )
                 torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
                 optimizer.step()
@@ -753,7 +753,7 @@ def cmd_train(args):
                     denoiser.train()
                     optimizer.zero_grad()
                     ponder_losses, memory = ponder_trainer.train_step(
-                        x0, optimizer, memory, answer_mask=answer_mask,
+                        x0, memory=memory, answer_mask=answer_mask,
                     )
                     torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
                     optimizer.step()
