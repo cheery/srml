@@ -679,6 +679,27 @@ def cmd_train(args):
                 ponder_losses, memory = ponder_trainer.train_step(
                     x0, memory=memory, answer_mask=answer_mask,
                 )
+                # --- Gradient flow diagnostic ---
+                if global_step % args.report_every == 0:
+                    groups = {
+                        "ponder.block": denoiser.ponder.block,
+                        "ponder.q_head": denoiser.ponder.q_head,
+                        "front_layers": denoiser.front_layers,
+                        "back_layers": denoiser.back_layers,
+                        "latent_memory": denoiser.latent_memory,
+                        "latent_memory_in": denoiser.latent_memory_in,
+                        "out_proj": denoiser.out_proj,
+                    }
+                    grad_parts = []
+                    for name, mod in groups.items():
+                        grads = [p.grad for p in mod.parameters() if p.grad is not None]
+                        if grads:
+                            norm = torch.cat([g.flatten() for g in grads]).norm().item()
+                        else:
+                            norm = 0.0
+                        grad_parts.append(f"{name}={norm:.4f}")
+                    print(f"    grad norms: {' | '.join(grad_parts)}")
+
                 torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()

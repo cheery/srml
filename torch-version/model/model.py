@@ -115,7 +115,8 @@ class SRLMDenoiser(nn.Module):
         h, c, p_emb = self.input(xt, t)
         for layer in self.front_layers:
             h = layer(h, c, p_emb)
-            h += torch.randn_like(h) * 0.01
+            if self.training:
+                h += torch.randn_like(h) * 0.01
         return h, c, p_emb
 
     def init_memory(self, batch_size, device):
@@ -136,7 +137,7 @@ class SRLMDenoiser(nn.Module):
         return z_H, z_L, q_values, memory, importance_scores
 
     def init_t(self, xt):
-        return torch.ones((xt.shape[0],), device=xt.device) * 2.0 # TODO: consider whether 1.0 should go here.
+        return torch.ones((xt.shape[0],), device=xt.device) * 2.0
 
     def pioneer(self, xt, t=None, memory=None):
         if t is None:
@@ -153,11 +154,12 @@ class SRLMDenoiser(nn.Module):
     def get_back(self, h, c, p_emb):
         for layer in self.back_layers:
             h = layer(h, c, p_emb)
-            h += torch.randn_like(h) * 0.01
+            if self.training:
+                h += torch.randn_like(h) * 0.01
         return h
 
     def get_behind(self, h, c, p_emb):
-        h = self.get_back(h, c, p_emb)
+        h = self.get_back(h, c, p_emb) + h
         return self.out_proj(h)
 
     def get_hidden(self, xt, t, memory=None):
@@ -165,7 +167,7 @@ class SRLMDenoiser(nn.Module):
         if memory is None:
             memory = self.init_memory(h.shape[0], h.device)
         h, importance_scores = self.latent_memory_in(h, memory)
-        h = self.get_back(h, c, p_emb)
+        h = self.get_back(h, c, p_emb) + h
         return h, importance_scores
 
     def forward(self, xt, t, memory=None):

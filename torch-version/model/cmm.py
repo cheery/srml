@@ -174,9 +174,11 @@ class PonderBlock(nn.Module):
         for _ in range(self.N_H):
             for _ in range(self.N_L):
                 z_L = self.block(z_H + z_L + x, c, pos_emb)
-                z_L = self._inject_noise(z_L)
+                if self.training:
+                    z_L = self._inject_noise(z_L)
             z_H = self.block(z_H + z_L, c, pos_emb)
-            z_H = self._inject_noise(z_H)
+            if self.training:
+                z_H = self._inject_noise(z_H)
 
         return z_H, z_L, self.q_head(z_H)
 

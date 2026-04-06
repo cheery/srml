@@ -141,6 +141,8 @@ def grpo_step(
     lambda_temp=5.0,
     train_steps=5,       # number of trajectory steps to train on
     T=1.0,
+    beta_dgpo=None,
+    verbose=True,
 ):
     """RL-D² RKL policy gradient for masked discrete diffusion.
 
@@ -233,7 +235,8 @@ def grpo_step(
                 a = advantages[idx].item()
                 print(f"        k={k}: {repr(gen_str):40s} reward={r:.3f} adv={a:.4f}")
         print()
-    debug()
+    if verbose:
+        debug()
 
     # Ponder trainer for auxiliary losses (BCE, mem, rep, equil, RH)
     clean_expanded = clean_batch.repeat_interleave(K, dim=0).to(device)
@@ -304,6 +307,27 @@ def grpo_step(
                 if state.compute_common_losses(seg, step_loss):
                     break
             state.finish()
+
+            # --- Gradient flow diagnostic ---
+            if verbose:
+                groups = {
+                    "ponder.block": denoiser.ponder.block,
+                    "ponder.q_head": denoiser.ponder.q_head,
+                    "front_layers": denoiser.front_layers,
+                    "back_layers": denoiser.back_layers,
+                    "latent_memory": denoiser.latent_memory,
+                    "latent_memory_in": denoiser.latent_memory_in,
+                    "out_proj": denoiser.out_proj,
+                }
+                grad_parts = []
+                for name, mod in groups.items():
+                    grads = [p.grad for p in mod.parameters() if p.grad is not None]
+                    if grads:
+                        norm = torch.cat([g.flatten() for g in grads]).norm().item()
+                    else:
+                        norm = 0.0
+                    grad_parts.append(f"{name}={norm:.4f}")
+                print(f"    grpo grad norms: {' | '.join(grad_parts)}")
 
             torch.nn.utils.clip_grad_norm_(denoiser.parameters(), grad_clip)
             optimizer.step()
