@@ -23,7 +23,7 @@ from .edlm import (
         LogLinearSchedule, EnergyModelBase,
 )
 from .gmem import (
-        LatentMemoryTerminal, LatentMemoryIn,
+        LatentMemoryTerminal,
         LatentMemoryBank, MemoryLoss
 )
 from .cmm import (
@@ -68,8 +68,8 @@ class SRLMEnergyModel(EnergyModelBase):
     def init_from_denoiser(self, denoiser):
         self.denoiser.load_state_dict(denoiser.state_dict())
 
-    def forward(self, x0, t, memory=None):
-        h, importance_scores = self.denoiser.get_hidden(x0, t, memory)
+    def forward(self, x0, t, z_H=None):
+        h = self.denoiser.get_hidden(x0, t, z_H)
         return self.outlet(h)
 
 class SRLMDenoiser(nn.Module):
@@ -84,14 +84,12 @@ class SRLMDenoiser(nn.Module):
             init_layer(cfg)
             for _ in range(cfg.front_layers)
         ])
-        self.latent_memory_in = LatentMemoryIn(
-                cfg.hidden_dim,
-                cfg.gmem.memory_dim,
-                cfg.num_heads)
         self.latent_memory = LatentMemoryBank(
                     cfg.hidden_dim,
                     cfg.gmem.memory_dim,
                     cfg.num_heads)
+        dim = cfg.hidden_dim
+        self.z_gate = nn.Sequential(nn.SiLU(), nn.Linear(dim, 2 * dim))
         self.ponder = PonderBlock(
             cfg.hidden_dim,
             cfg.max_context_length,
@@ -148,8 +146,8 @@ class SRLMDenoiser(nn.Module):
             z_H, z_L, q_values, memory, importance_scores = self.roll(h, c, p_emb, z_H, z_L, memory=None)
             q_mean = q_values.mean(0)
             if q_mean[0] > q_mean[1]:
-                return memory
-        return memory
+                return z_H, memory
+        return z_H, memory
 
     def get_back(self, h, c, p_emb):
         for layer in self.back_layers:
@@ -159,19 +157,20 @@ class SRLMDenoiser(nn.Module):
         return h
 
     def get_behind(self, h, c, p_emb):
-        h = self.get_back(h, c, p_emb) + h
+        h = self.get_back(h, c, p_emb)
         return self.out_proj(h)
 
-    def get_hidden(self, xt, t, memory=None):
+    def get_hidden(self, xt, t, z_H=None):
         h, c, p_emb = self.get_front(xt, t)
-        if memory is None:
-            memory = self.init_memory(h.shape[0], h.device)
-        h, importance_scores = self.latent_memory_in(h, memory)
-        h = self.get_back(h, c, p_emb) + h
-        return h, importance_scores
+        if z_H is not None:
+            z1, _ = self.z_gate(c).unsqueeze(1).chunk(2, dim=-1)
+            h = self.get_back(h + z_H * z1, c, p_emb)
+        else:
+            h = self.get_back(h, c, p_emb)
+        return h
 
-    def forward(self, xt, t, memory=None):
-        h, importance_scores = self.get_hidden(xt, t, memory)
+    def forward(self, xt, t, z_H=None):
+        h = self.get_hidden(xt, t, z_H)
         return self.out_proj(h)
 
 def init_layer(cfg):
@@ -260,31 +259,30 @@ class SelfAttention(nn.Module):
 # Training losses
 # ============================================================
 
-def mdlm_loss(denoiser, x0, schedule, memory=None,
+def mdlm_loss(denoiser, x0, schedule, z_H=None,
               answer_mask=None, t_min=1e-4):
     """
     MDLM denoiser loss: cross-entropy on masked positions.
 
     Returns:
-        loss, memory, importance_scores
+        loss
     """
     mask_id = denoiser.cfg.vocab_size
     loss_fn = MDLMLoss(schedule, mask_id, t_min=t_min)
     xt, t, is_masked = loss_fn.perturb(x0, answer_mask=answer_mask)
-    h, importance_scores = denoiser.get_hidden(xt, t, memory)
-    logits = denoiser.out_proj(h)
+    logits = denoiser(xt, t, z_H)
     loss = loss_fn(logits, x0, is_masked)
-    return loss, memory, importance_scores
+    return loss
 
 
 def nce_loss(energy_model, denoiser, x0, schedule,
-             memory=None, answer_mask=None, t_min=1e-4):
+             z_H=None, answer_mask=None, t_min=1e-4):
     """
     NCE loss for the energy model.
     Denoiser is frozen (no_grad); only energy_model gets gradients.
 
     Returns:
-        loss, memory, importance_scores
+        loss
     """
     n_vocab = denoiser.cfg.vocab_size
     mask_id = n_vocab
@@ -294,15 +292,15 @@ def nce_loss(energy_model, denoiser, x0, schedule,
 
     # Negative sample from frozen denoiser
     with torch.no_grad():
-        logits = denoiser(xt, t, memory)
+        logits = denoiser(xt, t, z_H)
     x_neg = loss_fn.sample_neg(x0, logits, is_masked)
 
     # Energies -- positive (true x0) and negative (denoiser sample)
-    e_pos = energy_model(x0, t, memory)
-    e_neg = energy_model(x_neg, t, memory)
+    e_pos = energy_model(x0, t, z_H)
+    e_neg = energy_model(x_neg, t, z_H)
 
     loss = loss_fn(e_pos, e_neg)
-    return loss, memory, importance_scores
+    return loss
 
 
 # ============================================================
@@ -312,10 +310,10 @@ def nce_loss(energy_model, denoiser, x0, schedule,
 @torch.no_grad()
 def sample(denoiser, schedule, batch_size, seq_len, num_steps=256,
            energy_model=None, k=8, window_w=0.2,
-           memory=None,
+           z_H=None,
            device=torch.device("cpu")):
     """
-    MDLM / EDLM sampling with memory
+    MDLM / EDLM sampling with optional ponder state
 
     Args:
         denoiser:      SRLMDenoiser
@@ -323,11 +321,10 @@ def sample(denoiser, schedule, batch_size, seq_len, num_steps=256,
         energy_model:  SRLMEnergyModel or None (pure MDLM if None)
         k:             importance sampling candidates (only with energy_model)
         window_w:      importance sampling window [1-w, 1]
-        memory:        initial G-Mem state or None
+        z_H:           ponder state from pioneer, or None
 
     Returns:
         xt:      generated tokens (batch_size, seq_len)
-        memory:  final memory state
     """
     n_vocab = denoiser.cfg.vocab_size
     mask_id = n_vocab
@@ -335,17 +332,17 @@ def sample(denoiser, schedule, batch_size, seq_len, num_steps=256,
     xt, stepper = sampler(batch_size, seq_len, device, num_steps)
 
     for s in stepper:
-        logits = denoiser(xt, s.t, memory)
+        logits = denoiser(xt, s.t, z_H)
         if energy_model is not None and s.tau_n >= 1.0 - window_w:
             candidates = s.propose_x0_k(xt, logits, k)       # (k, B, L)
             c_flat = candidates.reshape(k * batch_size, seq_len)
             t_flat = s.t.unsqueeze(0).expand(k, -1).reshape(k * batch_size)
-            if memory is not None:
-                mem_flat = memory.unsqueeze(0).expand(k, -1, -1, -1) \
-                                 .reshape(k * batch_size, *memory.shape[1:])
+            if z_H is not None:
+                zH_flat = z_H.unsqueeze(0).expand(k, -1, -1, -1) \
+                              .reshape(k * batch_size, *z_H.shape[1:])
             else:
-                mem_flat = None
-            energies = energy_model(c_flat, t_flat, mem_flat)
+                zH_flat = None
+            energies = energy_model(c_flat, t_flat, zH_flat)
             energies = energies.reshape(k, batch_size)
             x0 = s.select_by_energy(candidates, energies)
         else:
@@ -353,7 +350,7 @@ def sample(denoiser, schedule, batch_size, seq_len, num_steps=256,
 
         xt = s.reverse_step(xt, x0)
 
-    return xt, memory
+    return xt
 
 
 # ============================================================
@@ -469,7 +466,6 @@ class PonderTrainerState:
         # Set after roll()
         self.q_values = None
         self.importance_scores = None
-        self.importance_scores2 = None
         self.c = None
         self.p_emb = None
         # Set before compute_common_losses (by compute_losses or externally)
@@ -490,14 +486,12 @@ class PonderTrainerState:
 
         # Fresh perturbation each segment -- different t, different masks
         xt, t, is_masked = self.loss_fn.perturb(self.x0, answer_mask=self.answer_mask)
-        h2, importance_scores2 = denoiser.get_hidden(xt, t, self.memory)
-        logits = denoiser.out_proj(h2)
+        logits = denoiser(xt, t, self.z_H)
         lm_loss = self.loss_fn(logits, self.x0, is_masked)
 
         # Store for compute_common_losses (BCE needs logits + is_masked)
         self.logits = logits
         self.is_masked = is_masked
-        self.importance_scores2 = importance_scores2
 
         return self.compute_common_losses(seg, lm_loss)
 
@@ -523,10 +517,7 @@ class PonderTrainerState:
 
         # Memory regularization
         mem_loss_fn = MemoryLoss()
-        mem_loss = mem_loss_fn(self.importance_scores)
-        if self.importance_scores2 is not None:
-            mem_loss = mem_loss + mem_loss_fn(self.importance_scores2)
-        losses["mem"] = mem_loss
+        losses["mem"] = mem_loss_fn(self.importance_scores)
 
         losses["rep"] = repulsion_loss(self.z_H)
 

@@ -164,13 +164,13 @@ def grpo_step(
 
     # Pioneer: let the model "think" about the prompt before generating
     with torch.no_grad():
-        old_memory = denoiser.pioneer(prompt_batch, memory=memory)
-        ref_memory = ref_denoiser.pioneer(prompt_batch, memory=memory)
+        old_z_H, old_memory = denoiser.pioneer(prompt_batch, memory=memory)
+        ref_z_H, ref_memory = ref_denoiser.pioneer(prompt_batch, memory=memory)
 
     prompt_expanded = prompt_batch.repeat_interleave(K, dim=0)
     visible_expanded = prompt_expanded != mask_id
-    old_memory_expanded = old_memory.repeat_interleave(K, dim=0)
-    ref_memory_expanded = ref_memory.repeat_interleave(K, dim=0)
+    old_z_H_expanded = old_z_H.repeat_interleave(K, dim=0)
+    ref_z_H_expanded = ref_z_H.repeat_interleave(K, dim=0)
 
     sampler = Sampler(schedule, mask_id, denoiser.cfg.vocab_size)
     xt, stepper = sampler(B * K, L, device, sampling_steps)
@@ -182,13 +182,13 @@ def grpo_step(
         for s in stepper:
             is_masked = (xt == mask_id)
 
-            logits = denoiser(xt, s.t, old_memory_expanded)
+            logits = denoiser(xt, s.t, old_z_H_expanded)
             x0 = s.propose_x0(xt, logits/T)
 
             old_logp = F.log_softmax(logits/T, dim=-1)
             old_logp = torch.gather(old_logp, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
 
-            ref_logits = ref_denoiser(xt, s.t, ref_memory_expanded)
+            ref_logits = ref_denoiser(xt, s.t, ref_z_H_expanded)
             ref_logp = F.log_softmax(ref_logits/T, dim=-1)
             ref_logp = torch.gather(ref_logp, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
 
@@ -199,7 +199,6 @@ def grpo_step(
                 "old_logp": old_logp.clone(),
                 "ref_logp": ref_logp.clone(),
                 "is_masked": is_masked.clone(),
-                "memory": old_memory_expanded,
             })
 
             xt = s.reverse_step(xt, x0)
@@ -277,7 +276,7 @@ def grpo_step(
             for seg in range(trainer.N_super):
                 state.roll()
 
-                logits_s = denoiser(xt_s, t_s, memory=state.memory)
+                logits_s = denoiser(xt_s, t_s, z_H=state.z_H)
                 curr_logp_s = F.log_softmax(logits_s/T, dim=-1)
                 curr_logp_s = torch.gather(curr_logp_s, dim=-1, index=x0_s.unsqueeze(-1)).squeeze(-1)
 
@@ -316,7 +315,7 @@ def grpo_step(
                     "front_layers": denoiser.front_layers,
                     "back_layers": denoiser.back_layers,
                     "latent_memory": denoiser.latent_memory,
-                    "latent_memory_in": denoiser.latent_memory_in,
+                    "z_gate": denoiser.z_gate,
                     "out_proj": denoiser.out_proj,
                 }
                 grad_parts = []

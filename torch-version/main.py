@@ -687,7 +687,7 @@ def cmd_train(args):
                         "front_layers": denoiser.front_layers,
                         "back_layers": denoiser.back_layers,
                         "latent_memory": denoiser.latent_memory,
-                        "latent_memory_in": denoiser.latent_memory_in,
+                        "z_gate": denoiser.z_gate,
                         "out_proj": denoiser.out_proj,
                     }
                     grad_parts = []
@@ -749,23 +749,15 @@ def cmd_train(args):
                 denoiser.train()
                 optimizer.zero_grad()
 
-                loss, memory, importance_scores = mdlm_loss(
-                    denoiser, x0, schedule, memory,
+                loss = mdlm_loss(
+                    denoiser, x0, schedule,
                     answer_mask=answer_mask,
                 )
-                loss += mem_loss_fn(importance_scores)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
                 ema.update(denoiser)
-
-                if memory is not None:
-                    memory = memory.detach()
-
-                # Store in replay buffer
-                if replay_buffer is not None and memory is not None:
-                    replay_buffer.store(x0, memory, answer_mask)
 
                 avg_loss = loss.item()
 
@@ -787,19 +779,15 @@ def cmd_train(args):
                 denoiser.train()
                 optimizer.zero_grad()
 
-                loss, memory, importance_scores = mdlm_loss(
-                    denoiser, replay_x0, schedule, replay_mem,
+                loss = mdlm_loss(
+                    denoiser, replay_x0, schedule,
                     answer_mask=replay_mask,
                 )
-                loss += mem_loss_fn(importance_scores)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
                 ema.update(denoiser)
-
-                if memory is not None:
-                    memory = memory.detach()
 
                 avg_loss = loss.item()
 
@@ -851,8 +839,8 @@ def cmd_train(args):
             if global_step % args.sample_every == 0:
                 denoiser.eval()
                 ema.apply(denoiser)
-                s, _ = sample(denoiser, schedule, batch_size=2, seq_len=seq_len,
-                              num_steps=64, device=device)
+                s = sample(denoiser, schedule, batch_size=2, seq_len=seq_len,
+                           num_steps=64, device=device)
                 for i in range(min(2, s.shape[0])):
                     print(f"    sample {i+1}: {repr(as_text(s[i][:80]))}")
                 ema.restore(denoiser)
@@ -991,10 +979,10 @@ def cmd_eval(args):
             cm = clue_mask[:q_len].to(device)
             cv = clue_values[:q_len].to(device)
             xt[0, :q_len] = torch.where(cm, cv, xt[0, :q_len])
-            memory = denoiser.pioneer(xt, None, memory)
+            z_H, memory = denoiser.pioneer(xt, None, memory)
             with torch.no_grad():
                 for step in stepper:
-                    logits = denoiser(xt, step.t, memory)
+                    logits = denoiser(xt, step.t, z_H)
                     x0 = step.propose_x0(xt, logits)
                     xt = step.reverse_step(xt, x0)
                     xt[0, :q_len] = torch.where(cm, cv, xt[0, :q_len])
@@ -1040,10 +1028,10 @@ def cmd_eval(args):
             xt, stepper = sampler_obj(1, seq_len, device, args.steps)
             q_len = min(len(query), seq_len)
             xt[0, :q_len] = query[:q_len].to(device)
-            memory = denoiser.pioneer(xt, None, memory)
+            z_H, memory = denoiser.pioneer(xt, None, memory)
             with torch.no_grad():
                 for step in stepper:
-                    logits = denoiser(xt, step.t, memory)
+                    logits = denoiser(xt, step.t, z_H)
                     x0 = step.propose_x0(xt, logits)
                     xt = step.reverse_step(xt, x0)
             print(as_text(xt[0]))
@@ -1051,10 +1039,10 @@ def cmd_eval(args):
             # Empty input: free generate from current memory state
             sampler_obj = Sampler(schedule, MASK_TOKEN, VOCAB_SIZE)
             xt, stepper = sampler_obj(1, seq_len, device, args.steps)
-            memory = denoiser.pioneer(xt, None, memory)
+            z_H, memory = denoiser.pioneer(xt, None, memory)
             with torch.no_grad():
                 for step in stepper:
-                    logits = denoiser(xt, step.t, memory)
+                    logits = denoiser(xt, step.t, z_H)
                     x0 = step.propose_x0(xt, logits)
                     xt = step.reverse_step(xt, x0)
 
