@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 from .stablemax import SelfAttention
 from .rotary import RotaryPositionEmbedding, Rotor
+from .ddl import DeltaResidualExpanded
 
 # ============================================================
 # Recursive Transformer Block (Section 3.6, Fig 2)
@@ -50,37 +51,48 @@ class RecursiveBlock(nn.Module):
     Post-norm is critical: it constrains the state magnitude after each
     residual addition, preventing representation blowup during deep recursion.
     Uses tanh activation for contraction mapping properties (Section 3.6).
+
+    Uses DDL expanded residuals (d_v channels) instead of standard skip
+    connections, allowing additive+subtractive updates via rank-1 deltas.
     """
     def __init__(self, dim: int, num_heads: int = 4,
                  mlp_ratio: int = 4, use_attention: bool = False,
-                 use_stablemax: str = "none"):
+                 use_stablemax: str = "none", d_v: int = 4):
         super().__init__()
+        self.d_v = d_v
         self.layers = nn.ModuleList()
+        self.attn_deltas = nn.ModuleList()
+        self.mlp_deltas = nn.ModuleList()
         for _ in range(2):  # ×2 sub-layers
             layer = nn.ModuleDict({
-                "adaln": nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim)),
-
-                "norm1": nn.LayerNorm(dim, elementwise_affine=False),
-                "norm2": nn.LayerNorm(dim, elementwise_affine=False),
-                "rms1": nn.RMSNorm(dim),
-                "rms2": nn.RMSNorm(dim),
                 "mlp": nn.Sequential(
                     nn.Linear(dim, dim * mlp_ratio),
                     nn.Tanh(),
                     nn.Linear(dim * mlp_ratio, dim),
                 ),
                 "mixer": SelfAttention(dim, num_heads, use_stablemax),
+                "rms1": nn.RMSNorm(dim),
+                "rms2": nn.RMSNorm(dim),
             })
             self.layers.append(layer)
+            self.attn_deltas.append(DeltaResidualExpanded(dim, d_v))
+            self.mlp_deltas.append(DeltaResidualExpanded(dim, d_v))
 
-    def forward(self, x, c, p_emb):
-        for layer in self.layers:
-            g1, b1, a1, g2, b2, a2 = layer["adaln"](c).unsqueeze(1).chunk(6, dim=-1)
-            h = layer["norm1"](x) * (1 + g1) + b1
-            x = layer["rms1"](x + a1 * layer["mixer"](h, p_emb))
-            h = layer["norm2"](x) * (1 + g2) + b2
-            x = layer["rms2"](x + a2 * layer["mlp"](h))
-        return x
+    def forward(self, X, p_emb):
+        # X: (B, T, d, d_v)
+        for i, layer in enumerate(self.layers):
+            x_in = self.attn_deltas[i].compress(X)
+            sublayer_out = layer["mixer"](x_in, p_emb)
+            X = self.attn_deltas[i](X, sublayer_out, x_in)
+            # Post-norm on each value channel to bound state magnitude
+            X = layer["rms1"](X.permute(0, 1, 3, 2)).permute(0, 1, 3, 2)
+
+            x_in = self.mlp_deltas[i].compress(X)
+            sublayer_out = layer["mlp"](x_in)
+            X = self.mlp_deltas[i](X, sublayer_out, x_in)
+            X = layer["rms2"](X.permute(0, 1, 3, 2)).permute(0, 1, 3, 2)
+
+        return X
 
 
 # ============================================================
@@ -99,7 +111,9 @@ class QHead(nn.Module):
         self.proj = nn.Linear(dim * seq_len, 2)
 
     def forward(self, z_H: torch.Tensor) -> torch.Tensor:
-        """z_H: (B, S, D) → (B, 2) Q-values after sigmoid."""
+        """z_H: (B, S, D) or (B, S, D, d_v) → (B, 2) Q-values after sigmoid."""
+        if z_H.dim() == 4:
+            z_H = z_H.mean(dim=-1)
         B = z_H.size(0)
         flat = z_H.reshape(B, -1)
         return torch.sigmoid(self.proj(flat))
@@ -131,16 +145,18 @@ class PonderBlock(nn.Module):
                  noise_sigma: float = 0.01,
                  noise_type: str = "additive",
                  use_attention: bool = False,
-                 use_stablemax: str = "3"):
+                 use_stablemax: str = "3",
+                 d_v: int = 4):
         super().__init__()
         self.N_H = N_H
         self.N_L = N_L
+        self.d_v = d_v
         self.noise_sigma = noise_sigma
         self.noise_type = noise_type
 
         self.block = RecursiveBlock(
             dim, num_heads, mlp_ratio,
-            use_attention, use_stablemax,
+            use_attention, use_stablemax, d_v=d_v,
         )
         self.q_head = QHead(dim, max_context_length)
 
@@ -155,28 +171,27 @@ class PonderBlock(nn.Module):
             return z * (1.0 + noise)
 
     def forward(self, x: torch.Tensor,
-                c: torch.Tensor,
                 pos_emb: Rotor,
                 z_H: torch.Tensor,
                 z_L: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
-            x:   input representation (B, S, D) — drives the L-module
-            z_H: initial high-level state (B, S, D) or None → clone of x
-            z_L: initial low-level state (B, S, D) or None → zeros
+            x:   input representation (B, S, D, d_v) — drives the L-module
+            z_H: initial high-level state (B, S, D, d_v)
+            z_L: initial low-level state (B, S, D, d_v)
 
         Returns:
-            z_H:      final high-level state (B, S, D)
-            z_L:      final low-level state (B, S, D)
+            z_H:      final high-level state (B, S, D, d_v)
+            z_L:      final low-level state (B, S, D, d_v)
             q_values: halt/continue Q-values (B, 2)
         """
         for _ in range(self.N_H):
             for _ in range(self.N_L):
-                z_L = self.block(z_H + z_L + x, c, pos_emb)
+                z_L = self.block(z_H + z_L + x, pos_emb)
                 if self.training:
                     z_L = self._inject_noise(z_L)
-            z_H = self.block(z_H + z_L, c, pos_emb)
+            z_H = self.block(z_H + z_L, pos_emb)
             if self.training:
                 z_H = self._inject_noise(z_H)
 
@@ -216,11 +231,13 @@ class CMM(nn.Module):
         use_stablemax: str = "3",
         noise_sigma: float = 0.0,
         noise_type: str = "additive",
+        d_v: int = 4,
     ):
         super().__init__()
         self.n_vocab = n_vocab
         self.seq_len = seq_len
         self.dim = dim
+        self.d_v = d_v
         self.use_stablemax = use_stablemax
 
         self.input_embed = nn.Embedding(n_vocab, dim)
@@ -232,13 +249,17 @@ class CMM(nn.Module):
         self.ponder = PonderBlock(
             dim, seq_len, num_heads, mlp_ratio,
             N_H, N_L, noise_sigma, noise_type,
-            use_attention, use_stablemax,
+            use_attention, use_stablemax, d_v=d_v,
         )
 
     @property
     def block(self):
         """Access the shared RecursiveBlock (for auxiliary losses)."""
         return self.ponder.block
+
+    def _expand(self, x):
+        """Expand (B, T, d) → (B, T, d, d_v) for DDL blocks."""
+        return x.unsqueeze(-1).expand(*x.shape, self.d_v).contiguous()
 
     def forward(
         self,
@@ -257,11 +278,12 @@ class CMM(nn.Module):
             dict with: logits, z_H, z_L, q_values
         """
         x_emb = self.input_embed(x)
+        x_exp = self._expand(x_emb)
         p_emb = self.pos_embed(x.shape[1])
-        z_H, z_L, q_values = self.ponder(x_emb, p_emb, z_H, z_L)
+        z_H, z_L, q_values = self.ponder(x_exp, p_emb, z_H, z_L)
 
         return {
-            "logits": self.output_embed(z_H),
+            "logits": self.output_embed(z_H.mean(dim=-1)),
             "z_H": z_H,
             "z_L": z_L,
             "q_values": q_values,
@@ -273,7 +295,7 @@ class CMM(nn.Module):
 # ============================================================
 
 def equilibrium_loss(z_H: torch.Tensor, z_L: torch.Tensor,
-                     block: RecursiveBlock, c, p_emb) -> torch.Tensor:
+                     block: RecursiveBlock, p_emb) -> torch.Tensor:
     """
     Equilibrium loss (Eq 30):
     L_equil = [ẑ_H - F̂_H(ẑ_H + ẑ_L; θ_H)]²
@@ -283,12 +305,12 @@ def equilibrium_loss(z_H: torch.Tensor, z_L: torch.Tensor,
     that cause instability.
     """
     inp = (z_H + z_L).detach()
-    target = block(inp, c, p_emb)
+    target = block(inp, p_emb)
     return F.mse_loss(z_H, target)
 
 
 def routh_hurwitz_stable_loss(z: torch.Tensor,
-                              block: RecursiveBlock, c, p_emb) -> torch.Tensor:
+                              block: RecursiveBlock, p_emb) -> torch.Tensor:
     """
     RH stability loss (Eq 31):
     L_RH_stable = [ReLU(1/K Σ J_ii - 1)]²
@@ -299,19 +321,19 @@ def routh_hurwitz_stable_loss(z: torch.Tensor,
     Uses finite-difference approximation of the Jacobian diagonal.
     """
     z_req = z.detach().requires_grad_(True)
-    Fz = block(z_req, c, p_emb)
+    Fz = block(z_req, p_emb)
     # Approximate trace of Jacobian via random projection (Hutchinson's trick)
     v = torch.randn_like(z_req)
     Fz_v = (Fz * v).sum()
     grad_v = torch.autograd.grad(Fz_v, z_req, create_graph=True)[0]
     # E[v^T J v] = trace(J), normalized by K = total elements per sample
-    K = z.shape[1] * z.shape[2]  # S * D
-    trace_est = (grad_v * v).sum(dim=(1, 2)) / K  # (B,) ≈ mean(J_ii)
+    K = z[0].numel()
+    trace_est = (grad_v * v).flatten(1).sum(dim=1) / K  # (B,)
     return F.relu(trace_est - 1.0).pow(2).mean()
 
 
 def routh_hurwitz_unstable_loss(z: torch.Tensor,
-                                block: RecursiveBlock, c, p_emb) -> torch.Tensor:
+                                block: RecursiveBlock, p_emb) -> torch.Tensor:
     """
     RH unstable loss (Eq 32):
     L_RH_unstable = [ReLU(1 - 1/K Σ J_ii)]²
@@ -320,12 +342,12 @@ def routh_hurwitz_unstable_loss(z: torch.Tensor,
     unstable equilibrium point ẑ_H = x̃ (repeller).
     """
     z_req = z.detach().requires_grad_(True)
-    Fz = block(z_req, c, p_emb)
+    Fz = block(z_req, p_emb)
     v = torch.randn_like(z_req)
     Fz_v = (Fz * v).sum()
     grad_v = torch.autograd.grad(Fz_v, z_req, create_graph=True)[0]
-    K = z.shape[1] * z.shape[2]
-    trace_est = (grad_v * v).sum(dim=(1, 2)) / K
+    K = z[0].numel()
+    trace_est = (grad_v * v).flatten(1).sum(dim=1) / K
     return F.relu(1.0 - trace_est).pow(2).mean()
 
 
@@ -569,10 +591,11 @@ class CMMTrainer:
         """
         self.model.train()
         x_emb = self.model.input_embed(x)
+        x_exp = self.model._expand(x_emb)
 
         # Initialize latent states (Section 4.4: initialized by x̃ and 0)
-        z_H = x_emb.clone()
-        z_L = torch.zeros_like(x_emb)
+        z_H = x_exp.clone()
+        z_L = torch.zeros_like(x_exp)
 
         all_losses = {k: 0.0 for k in [
             "LM", "BCE", "rep_x", "rep_z",
@@ -582,12 +605,13 @@ class CMMTrainer:
 
         for seg in range(self.N_super):
             x_emb = self.model.input_embed(x)
+            x_exp = self.model._expand(x_emb)
             p_emb = self.model.pos_embed(x.shape[1])
             # Forward reasoning pass
-            z_H_new, z_L_new, q_values = self.model.ponder(x_emb, p_emb, z_H, z_L)
+            z_H_new, z_L_new, q_values = self.model.ponder(x_exp, p_emb, z_H, z_L)
 
             result = {
-                "logits": self.model.output_embed(z_H_new),
+                "logits": self.model.output_embed(z_H_new.mean(dim=-1)),
                 "z_H": z_H_new,
                 "z_L": z_L_new,
                 "q_values": q_values,
@@ -596,7 +620,7 @@ class CMMTrainer:
             # Only compute expensive losses (equilibrium, RH) on last segment
             # where z_H should actually be near the fixed point
             is_last = (seg == self.N_super - 1)
-            losses = self.compute_losses(result, y, x_emb, p_emb,
+            losses = self.compute_losses(result, y, x_exp, p_emb,
                                          compute_expensive=is_last)
             total = self.weighted_loss(losses) / N_accum
 

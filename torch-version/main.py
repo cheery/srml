@@ -687,7 +687,6 @@ def cmd_train(args):
                         "front_layers": denoiser.front_layers,
                         "back_layers": denoiser.back_layers,
                         "latent_memory": denoiser.latent_memory,
-                        "z_gate": denoiser.z_gate,
                         "out_proj": denoiser.out_proj,
                     }
                     grad_parts = []

@@ -182,20 +182,19 @@ def grpo_step(
         for s in stepper:
             is_masked = (xt == mask_id)
 
-            logits = denoiser(xt, s.t, old_z_H_expanded)
+            logits = denoiser(xt, old_z_H_expanded)
             x0 = s.propose_x0(xt, logits/T)
 
             old_logp = F.log_softmax(logits/T, dim=-1)
             old_logp = torch.gather(old_logp, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
 
-            ref_logits = ref_denoiser(xt, s.t, ref_z_H_expanded)
+            ref_logits = ref_denoiser(xt, ref_z_H_expanded)
             ref_logp = F.log_softmax(ref_logits/T, dim=-1)
             ref_logp = torch.gather(ref_logp, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
 
             trajectory.append({
                 "xt": xt.clone(),
                 "x0": x0.clone(),
-                "t":  s.t.clone(),
                 "old_logp": old_logp.clone(),
                 "ref_logp": ref_logp.clone(),
                 "is_masked": is_masked.clone(),
@@ -259,7 +258,6 @@ def grpo_step(
             optimizer.zero_grad()
             xt_s       = step_data["xt"]
             x0_s       = step_data["x0"]
-            t_s        = step_data["t"]
             old_logp_s = step_data["old_logp"]
             ref_logp_s = step_data["ref_logp"]
             is_masked  = step_data["is_masked"]
@@ -276,7 +274,7 @@ def grpo_step(
             for seg in range(trainer.N_super):
                 state.roll()
 
-                logits_s = denoiser(xt_s, t_s, z_H=state.z_H)
+                logits_s = denoiser(xt_s, z_H=state.z_H)
                 curr_logp_s = F.log_softmax(logits_s/T, dim=-1)
                 curr_logp_s = torch.gather(curr_logp_s, dim=-1, index=x0_s.unsqueeze(-1)).squeeze(-1)
 
@@ -315,7 +313,6 @@ def grpo_step(
                     "front_layers": denoiser.front_layers,
                     "back_layers": denoiser.back_layers,
                     "latent_memory": denoiser.latent_memory,
-                    "z_gate": denoiser.z_gate,
                     "out_proj": denoiser.out_proj,
                 }
                 grad_parts = []
